@@ -1,0 +1,27 @@
+[package]
+name = "why"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A Linux program troubleshooter: it explains why a program does not work"
+license = "MIT"
+readme = "README.md"
+keywords = ["linux", "elf", "troubleshooting", "diagnostics", "cli"]
+categories = ["command-line-utilities"]
+
+# v0.1 deliberately has no dependencies: the ELF reader is small enough to own,
+# and a diagnostic tool should be trivially auditable and buildable offline.
+[dependencies]
+
+[lib]
+name = "why"
+path = "src/lib.rs"
+
+[[bin]]
+name = "why"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

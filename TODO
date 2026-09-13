@@ -1,0 +1,239 @@
+# why
+
+A Linux program troubleshooter.
+
+```bash
+why ./some-broken-program
+```
+
+and it answers:
+
+```text
+WHY DOES THIS PROGRAM NOT WORK?
+
+✗ ELF interpreter
+  /lib64/ld-linux-x86-64.so.2        OK
+
+✗ Shared libraries
+  libwebkit2gtk-4.0.so.37            MISSING
+
+  Required by: /usr/bin/BitComet
+  Package providing it: ???
+
+✗ Symbol dependencies
+  3 unresolved symbols
+
+✓ Architecture
+  x86-64
+
+✓ GPU
+  AMD Radeon RX ...
+
+✓ Vulkan
+  Vulkan 1.4 ...
+
+✓ Wayland
+  KDE Plasma / KWin
+
+⚠ Environment
+  LD_LIBRARY_PATH is set
+
+Suggested next steps:
+  ...
+```
+
+And it could get progressively more ambitious.
+
+```bash
+why ./game
+why --steam 123456
+why --flatpak com.example.Game
+why --wine game.exe
+why --crash firefox
+```
+
+It could inspect:
+
+* ELF headers and dynamic loader
+* shared libraries and symbol versions
+* package ownership
+* ABI mismatches
+* permissions
+* Wayland/X11
+* Vulkan/OpenGL
+* GPU/driver state
+* Flatpak sandboxing
+* Wine/Proton
+* environment variables
+* coredumps
+* relevant `journalctl` messages
+* recent kernel errors
+* filesystem / mount problems
+
+And then produce a **human-readable explanation rather than 800 lines of diagnostic output**.
+
+That last part is important.
+
+Linux already has an absurd collection of excellent tools. `ldd`, `readelf`, `strace`, `coredumpctl`, `journalctl`, `vulkaninfo`, MangoHud, `wayland-debug`, etc. For example, `wayland-debug` can already inspect and filter Wayland protocol traffic, while MangoHud can log FPS, frame timing, GPU/CPU telemetry, and more. ([GitHub][2])
+
+The missing layer is often:
+
+> **“Okay, but what the fuck does all of this mean?”**
+
+That is why the project exists
+
+---
+
+# Why would someone use it
+
+The classic linux problems :
+
+```text
+program doesn't launch
+       ↓
+missing library
+       ↓
+package changed
+       ↓
+wrong ABI
+```
+
+GPU:
+
+```text
+game stutters
+       ↓
+VRAM?
+GPU saturation?
+shader compilation?
+frame pacing?
+Wayland?
+Wine?
+kernel?
+driver?
+```
+
+Networking:
+
+```text
+website doesn't load
+       ↓
+DNS?
+DoH?
+proxy?
+VPN?
+TLS?
+routing?
+```
+
+Audio:
+
+```text
+program renders incorrectly
+       ↓
+PipeWire?
+WirePlumber?
+ALSA?
+JACK?
+```
+
+Instead of manually doing:
+
+```bash
+journalctl ...
+grep ...
+ldd ...
+readelf ...
+pacman -Qo ...
+vulkaninfo ...
+ps ...
+cat /proc/...
+```
+
+the program becomes the thing that orchestrates all of that.
+
+---
+
+## "bug report mode"
+
+```bash
+why --report ./broken-program
+```
+
+Output:
+
+```text
+WHY 0.4.1
+
+Application
+  Path: /usr/bin/foo
+  PID: 19382
+  Version: 4.2.1
+
+System
+  Arch Linux
+  Linux 7.x
+  KDE Plasma 6.x
+  Wayland
+  AMD GPU
+
+Problem detected
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  libfoo.so.3 requires GLIBC_2.42
+  system provides GLIBC_2.41
+
+Confidence: 99%
+
+Relevant logs
+  ...
+
+Possible fixes
+  1. Update package foo
+  2. Reinstall package foo
+  3. Check for partial system upgrade
+
+Diagnostic bundle:
+  /tmp/why-report-19382.tar.zst
+```
+
+Then someone on Reddit/Discord/GitHub can literally say:
+
+> Run `why --report`, paste the output.
+
+That is the point where a hobby project starts turning into infrastructure.
+
+
+## Probably a evolution path??
+```text
+v0.1
+ELF + shared libraries
+
+v0.2
+Arch package ownership
+
+v0.3
+process/environment inspection
+
+v0.4
+Wayland/X11/Vulkan
+
+v0.5
+Flatpak
+
+v0.6
+Wine/Proton
+
+v0.7
+kernel/journal/coredumps
+
+v0.8
+automatic diagnosis
+
+v0.9
+HTML reports
+
+v1.0
+"paste this output into your GitHub issue"
+```
+
+[2]: https://github.com/wmww/wayland-debug?utm_source=chatgpt.com "GitHub - wmww/wayland-debug: A command line tool to help debug Wayland clients and servers · GitHub"
