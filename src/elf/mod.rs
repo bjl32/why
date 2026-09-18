@@ -256,6 +256,8 @@ pub struct ElfFile {
     pub defined_versions: Vec<String>,
     /// Version name/owner for each symbol version index.
     version_by_index: HashMap<u16, (String, String)>,
+    /// Defined version names keyed by `.gnu.version` index.
+    defined_version_map: HashMap<u16, String>,
 }
 
 impl ElfFile {
@@ -392,21 +394,28 @@ impl ElfFile {
         // Locate `.dynsym` and how many entries it has.
         let dynsym_sec = section_by_name(&shdrs, shstr, endian, ".dynsym")
             .or_else(|| section_by_type(&shdrs, SHT_DYNSYM));
+        // The hash table states the symbol count independently of `.dynsym`'s
+        // size, so it is a reliable cap when the section header is damaged.
+        let hash_count = hash_symbol_count(&b, class, &phdrs, &dynamic);
         let (sym_off, sym_count, sym_stride) = if let Some(s) = dynsym_sec {
             let stride = if s.sh_entsize == 0 {
                 default_sym_size(class)
             } else {
                 s.sh_entsize as usize
             };
-            (s.sh_offset as usize, (s.sh_size as usize) / stride, stride)
+            let from_section = (s.sh_size as usize) / stride;
+            let count = match hash_count {
+                Some(hashed) => from_section.min(hashed),
+                None => from_section,
+            };
+            (s.sh_offset as usize, count, stride)
         } else if let Some(vaddr) = dyn_get(&dynamic, DT_SYMTAB) {
             let off = vaddr_to_offset(&phdrs, vaddr).unwrap_or(0);
             let stride = dyn_get(&dynamic, DT_SYMENT)
                 .map(|v| v as usize)
                 .filter(|v| *v > 0)
                 .unwrap_or_else(|| default_sym_size(class));
-            let count = hash_symbol_count(&b, class, &phdrs, &dynamic).unwrap_or(0);
-            (off, count, stride)
+            (off, hash_count.unwrap_or(0), stride)
         } else {
             (0, 0, default_sym_size(class))
         };
@@ -422,8 +431,11 @@ impl ElfFile {
 
         let indexed_needs =
             read_version_needs(&b, &shdrs, shstr, endian, &phdrs, &dynamic, &strtab_b);
-        let defined_versions =
+        let defined_entries =
             read_defined_versions(&b, &shdrs, shstr, endian, &phdrs, &dynamic, &strtab_b);
+        let defined_version_map: HashMap<u16, String> = defined_entries.iter().cloned().collect();
+        let defined_versions: Vec<String> =
+            defined_entries.into_iter().map(|(_, name)| name).collect();
 
         // Flatten the raw tables into the public shape, keeping a lookup from
         // symbol version index to the (version name, owning object) pair.
@@ -456,6 +468,7 @@ impl ElfFile {
             version_needs,
             defined_versions,
             version_by_index,
+            defined_version_map,
         })
     }
 
@@ -481,6 +494,15 @@ impl ElfFile {
         matches!(self.etype, ElfType::Executable | ElfType::Shared) && self.interpreter.is_some()
     }
 
+    /// The execute bit matters for this object: it is a program, not a library.
+    ///
+    /// A plain shared library is normally not executable, so only executables
+    /// (including static ones) and position-independent executables qualify.
+    pub fn is_runnable(&self) -> bool {
+        matches!(self.etype, ElfType::Executable)
+            || (matches!(self.etype, ElfType::Shared) && self.interpreter.is_some())
+    }
+
     /// The version name attached to a symbol, if it is versioned.
     pub fn version_name(&self, index: u16) -> Option<&str> {
         self.version_by_index
@@ -493,6 +515,11 @@ impl ElfFile {
         self.version_by_index
             .get(&index)
             .map(|(_, file)| file.as_str())
+    }
+
+    /// The name of a version this object defines, by `.gnu.version` index.
+    pub fn defined_version_name(&self, index: u16) -> Option<&str> {
+        self.defined_version_map.get(&index).map(String::as_str)
     }
 }
 
@@ -755,20 +782,31 @@ fn read_symbols(
     strtab: &Bytes<'_>,
     versym: &[u16],
 ) -> Vec<DynSymbol> {
+    // `count` comes from untrusted metadata and may be absurd. A symbol table
+    // cannot extend past the end of the file, so clamp it and stop at the first
+    // read that falls off the end instead of treating it as an empty symbol and
+    // looping on.
+    let stride = stride.max(1);
+    let available = b.len().saturating_sub(offset);
+    let count = count.min(available / stride + 1);
     let mut out = Vec::with_capacity(count.min(100_000));
     for i in 0..count {
-        let at = offset + i * stride;
+        let at = match i
+            .checked_mul(stride)
+            .and_then(|delta| offset.checked_add(delta))
+        {
+            Some(at) => at,
+            None => break,
+        };
         let (name_off, info, shndx) = match class {
-            Class::Elf64 => (
-                b.u32(at).unwrap_or(0),
-                b.u8(at + 4).unwrap_or(0),
-                b.u16(at + 6).unwrap_or(0),
-            ),
-            Class::Elf32 => (
-                b.u32(at).unwrap_or(0),
-                b.u8(at + 12).unwrap_or(0),
-                b.u16(at + 14).unwrap_or(0),
-            ),
+            Class::Elf64 => match (b.u32(at), b.u8(at + 4), b.u16(at + 6)) {
+                (Ok(name), Ok(info), Ok(shndx)) => (name, info, shndx),
+                _ => break,
+            },
+            Class::Elf32 => match (b.u32(at), b.u8(at + 12), b.u16(at + 14)) {
+                (Ok(name), Ok(info), Ok(shndx)) => (name, info, shndx),
+                _ => break,
+            },
         };
         if name_off == 0 {
             continue;
@@ -782,7 +820,8 @@ fn read_symbols(
             binding: Binding::from_raw(info >> 4),
             sym_type: SymType::from_raw(info & 0x0f),
             undefined: shndx == SHN_UNDEF,
-            version_index: versym.get(i).copied().unwrap_or(0),
+            // Bit 15 marks a non-default version; the index is the rest.
+            version_index: versym.get(i).copied().unwrap_or(0) & 0x7fff,
         });
     }
     out
@@ -868,6 +907,10 @@ fn read_version_needs(
 
 /// Returns the version-index -> (name, file) mapping as well, folded into the
 /// `VersionNeed` list above. This helper only collects defined version names.
+/// Reads `.gnu.version_d`, returning each defined version's index and name.
+///
+/// The index is the value that appears in `.gnu.version` for symbols defining
+/// that version, which is what makes per-symbol version checks possible.
 fn read_defined_versions(
     b: &Bytes<'_>,
     shdrs: &[Shdr],
@@ -876,7 +919,7 @@ fn read_defined_versions(
     phdrs: &[Phdr],
     dynamic: &[(i64, u64)],
     strtab: &Bytes<'_>,
-) -> Vec<String> {
+) -> Vec<(u16, String)> {
     let span = section_by_name(shdrs, shstr, endian, ".gnu.version_d")
         .or_else(|| section_by_type(shdrs, SHT_GNU_VERDEF))
         .map(|s| (s.sh_offset as usize, s.sh_size as usize));
@@ -898,15 +941,19 @@ fn read_defined_versions(
     let mut out = Vec::new();
     let mut pos = 0usize;
     for _ in 0..4096 {
-        let (aux_rel, next) = match (region.u32(pos + 12), region.u32(pos + 16)) {
-            (Ok(a), Ok(n)) => (a as usize, n as usize),
+        let (ndx, aux_rel, next) = match (
+            region.u16(pos + 4),
+            region.u32(pos + 12),
+            region.u32(pos + 16),
+        ) {
+            (Ok(ndx), Ok(aux), Ok(next)) => (ndx, aux as usize, next as usize),
             _ => break,
         };
         // The first verdaux entry holds the version name; later ones name the
         // parent versions, which are already defined elsewhere.
         if let Ok(name_off) = region.u32(pos + aux_rel) {
             if let Some(name) = strtab.cstr(name_off as usize) {
-                out.push(name);
+                out.push((ndx, name));
             }
         }
         if next == 0 {
@@ -1074,6 +1121,21 @@ mod tests {
         data[54..56].copy_from_slice(&56u16.to_le_bytes());
         data[56..58].copy_from_slice(&1u16.to_le_bytes());
         assert!(ElfFile::parse_bytes(Path::new("/tmp/x"), &data).is_err());
+    }
+
+    #[test]
+    fn symbol_reading_stops_at_the_end_of_the_buffer() {
+        // Only two Elf64 entries fit, but the metadata claims a million. The
+        // reader must stop at the end of the buffer rather than looping on
+        // zero-filled reads.
+        let mut data = vec![0u8; 48];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        data[24..28].copy_from_slice(&2u32.to_le_bytes());
+        let b = Bytes::new(&data, Endian::Little);
+        let strtab = Bytes::new(b"\0foo\0bar\0", Endian::Little);
+        let symbols = read_symbols(&b, Class::Elf64, 0, 1_000_000, 24, &strtab, &[]);
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "foo");
     }
 
     #[test]

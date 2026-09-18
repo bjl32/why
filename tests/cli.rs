@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use why::analyze::{analyze, LibResolution};
-use why::elf::ElfFile;
+use why::elf::{Binding, ElfFile};
 
 fn why_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_why"))
@@ -158,6 +158,89 @@ fn detects_a_missing_shared_library() {
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains(&bogus), "{stdout}");
     assert!(stdout.contains("MISSING"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reports_a_missing_execute_bit() {
+    let dir = temp_dir("no-exec");
+    let source = std::env::current_exe().unwrap();
+    let path = dir.join("not-executable");
+    fs::copy(&source, &path).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&path, permissions).unwrap();
+
+    let analysis = analyze(&path).expect("analyze");
+    assert_eq!(analysis.exit_code(), 1);
+    assert!(!analysis.permissions.as_ref().unwrap().executable);
+
+    let output = run(&["--no-color", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("not executable"), "{stdout}");
+    assert!(stdout.contains("chmod +x"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checks_the_env_interpreter_through_path() {
+    let dir = temp_dir("env-path");
+    let script = dir.join("script");
+    fs::write(&script, b"#!/usr/bin/env why-no-such-interpreter\n").unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let output = run(&["--no-color", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("not found on PATH"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn detects_an_unresolved_symbol() {
+    let dir = temp_dir("bad-symbol");
+    let source = std::env::current_exe().unwrap();
+    let elf = ElfFile::parse(&source).unwrap();
+    let Some(target) = elf
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.undefined && matches!(symbol.binding, Binding::Global) && symbol.name.len() >= 6
+        })
+        .map(|symbol| symbol.name.clone())
+    else {
+        return;
+    };
+    let bogus = "z".repeat(target.len());
+
+    let data = fs::read(&source).unwrap();
+    let patched = replace_all(
+        &data,
+        format!("{target}\0").as_bytes(),
+        format!("{bogus}\0").as_bytes(),
+    );
+    let path = dir.join("bad-symbol");
+    fs::write(&path, patched).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+
+    let analysis = analyze(&path).unwrap();
+    assert!(
+        analysis
+            .unresolved
+            .iter()
+            .any(|symbol| symbol.name == bogus),
+        "expected {bogus} to be unresolved: {:?}",
+        analysis.unresolved
+    );
+    assert_eq!(analysis.exit_code(), 1);
 
     fs::remove_dir_all(&dir).ok();
 }

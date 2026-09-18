@@ -14,9 +14,11 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::elf::reader::Endian;
 use crate::elf::{Class, ElfFile};
 
 /// One entry of the `ld.so` cache, as printed by `ldconfig -p`.
@@ -25,6 +27,71 @@ pub struct CacheEntry {
     pub name: String,
     pub arch: String,
     pub path: PathBuf,
+}
+
+/// The ELF class and machine a candidate library must have.
+///
+/// The dynamic loader refuses an object built for a different word size or
+/// machine, so `why` has to as well: on a multilib system `/usr/lib` and
+/// `/usr/lib32` can both contain `libc.so.6`, and choosing the wrong one
+/// corrupts every symbol and version result downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfIdentity {
+    pub class: Class,
+    pub machine: u16,
+}
+
+impl ElfIdentity {
+    /// The identity a `DT_NEEDED` entry must match.
+    pub fn of(elf: &ElfFile) -> Self {
+        Self {
+            class: elf.class,
+            machine: elf.machine,
+        }
+    }
+
+    pub fn matches(self, other: Self) -> bool {
+        self.class == other.class && self.machine == other.machine
+    }
+}
+
+/// The outcome of looking for one `DT_NEEDED` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchOutcome {
+    /// A usable object was found.
+    Found(PathBuf),
+    /// A file with the right name exists, but it is built for another
+    /// architecture, so the loader cannot use it.
+    WrongArchitecture(PathBuf, ElfIdentity),
+    /// Nothing with that name exists anywhere in the search path.
+    Missing,
+}
+
+/// Reads just the ELF identity (class and machine) of a file.
+///
+/// Only the first 20 bytes are read, so this is cheap even for a huge library.
+pub fn identify(path: &Path) -> Option<ElfIdentity> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let class = match header[4] {
+        1 => Class::Elf32,
+        2 => Class::Elf64,
+        _ => return None,
+    };
+    let endian = match header[5] {
+        1 => Endian::Little,
+        2 => Endian::Big,
+        _ => return None,
+    };
+    let machine = match endian {
+        Endian::Little => u16::from_le_bytes([header[18], header[19]]),
+        Endian::Big => u16::from_be_bytes([header[18], header[19]]),
+    };
+    Some(ElfIdentity { class, machine })
 }
 
 /// Resolves `DT_NEEDED` names against the real search path.
@@ -52,34 +119,59 @@ impl Resolver {
     /// Finds `name`, searching `rpath` then `LD_LIBRARY_PATH` then `runpath`
     /// then the cache then the defaults. `rpath` should already be empty if the
     /// loading object has a `DT_RUNPATH`.
-    pub fn search(&self, name: &str, rpath: &[PathBuf], runpath: &[PathBuf]) -> Option<PathBuf> {
+    ///
+    /// Candidates whose ELF class or machine does not match `wanted` are
+    /// skipped, mirroring the loader. If only mismatched candidates exist, the
+    /// first is reported as [`SearchOutcome::WrongArchitecture`] rather than
+    /// being silently accepted.
+    pub fn search(
+        &self,
+        name: &str,
+        wanted: Option<ElfIdentity>,
+        rpath: &[PathBuf],
+        runpath: &[PathBuf],
+    ) -> SearchOutcome {
         // A name containing a slash is used as a path verbatim.
-        if name.contains('/') {
-            let candidate = PathBuf::from(name);
-            return candidate.is_file().then_some(candidate);
-        }
-        for dir in rpath
-            .iter()
-            .chain(self.env_dirs.iter())
-            .chain(runpath.iter())
-        {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+        let candidates: Vec<PathBuf> = if name.contains('/') {
+            vec![PathBuf::from(name)]
+        } else {
+            rpath
+                .iter()
+                .chain(self.env_dirs.iter())
+                .chain(runpath.iter())
+                .map(|dir| dir.join(name))
+                .chain(
+                    self.cache
+                        .iter()
+                        .filter(|entry| entry.name == name)
+                        .map(|entry| entry.path.clone()),
+                )
+                .chain(self.defaults.iter().map(|dir| dir.join(name)))
+                .collect()
+        };
+
+        let mut mismatched: Option<(PathBuf, ElfIdentity)> = None;
+        for candidate in candidates {
+            if !candidate.is_file() {
+                continue;
+            }
+            match wanted {
+                Some(want) => match identify(&candidate) {
+                    Some(found) if found.matches(want) => return SearchOutcome::Found(candidate),
+                    Some(found) => {
+                        mismatched.get_or_insert((candidate, found));
+                    }
+                    // Not an ELF object: nothing to compare, so accept it.
+                    None => return SearchOutcome::Found(candidate),
+                },
+                None => return SearchOutcome::Found(candidate),
             }
         }
-        for entry in &self.cache {
-            if entry.name == name && entry.path.is_file() {
-                return Some(entry.path.clone());
-            }
+
+        match mismatched {
+            Some((path, found)) => SearchOutcome::WrongArchitecture(path, found),
+            None => SearchOutcome::Missing,
         }
-        for dir in &self.defaults {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
     }
 }
 
@@ -289,22 +381,55 @@ mod tests {
         assert_eq!(dirs[1], PathBuf::from("/usr/lib"));
     }
 
+    fn host_identity() -> ElfIdentity {
+        let elf = ElfFile::parse(&std::env::current_exe().unwrap()).unwrap();
+        ElfIdentity::of(&elf)
+    }
+
+    #[test]
+    fn identifies_an_elf_file() {
+        let path = std::env::current_exe().unwrap();
+        let elf = ElfFile::parse(&path).unwrap();
+        assert_eq!(identify(&path).unwrap(), ElfIdentity::of(&elf));
+    }
+
     #[test]
     fn resolves_libc_through_the_cache() {
         let resolver = Resolver::new();
-        let found = resolver.search("libc.so.6", &[], &[]);
-        assert!(
-            found.is_some(),
-            "libc.so.6 should resolve on a glibc system"
-        );
-        assert!(found.unwrap().is_file());
+        let wanted = host_identity();
+        match resolver.search("libc.so.6", Some(wanted), &[], &[]) {
+            SearchOutcome::Found(path) => {
+                assert!(path.is_file());
+                assert_eq!(identify(&path).unwrap(), wanted);
+            }
+            other => panic!("libc.so.6 should resolve on a glibc system, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn never_returns_a_library_of_the_wrong_class() {
+        // On a multilib system both libc.so.6 files exist; the loader picks by
+        // class, so `why` must never hand a 32-bit program a 64-bit library.
+        let resolver = Resolver::new();
+        let wanted = ElfIdentity {
+            class: Class::Elf32,
+            machine: 0x03,
+        };
+        match resolver.search("libc.so.6", Some(wanted), &[], &[]) {
+            SearchOutcome::Found(path) => {
+                assert_eq!(identify(&path).unwrap(), wanted, "resolved {path:?}");
+            }
+            SearchOutcome::WrongArchitecture(_, found) => assert_ne!(found, wanted),
+            SearchOutcome::Missing => {}
+        }
     }
 
     #[test]
     fn does_not_invent_libraries() {
         let resolver = Resolver::new();
-        assert!(resolver
-            .search("libdefinitely-not-a-real-library.so.99", &[], &[])
-            .is_none());
+        assert!(matches!(
+            resolver.search("libdefinitely-not-a-real-library.so.99", None, &[], &[]),
+            SearchOutcome::Missing
+        ));
     }
 }

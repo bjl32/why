@@ -30,13 +30,13 @@ WHY DOES THIS PROGRAM NOT WORK?
   position-independent executable (PIE) · 64-bit x86-64
 
 ✓ Architecture
-  x86-64, 64-bit            matches this system (x86-64)
+  x86-64, 64-bit            matches this system (x86-64, 64-bit)
 
 ✓ ELF interpreter
   /lib64/ld-linux-x86-64.so.2                    present
 
 ✓ Shared libraries
-  3 resolved, 0 missing
+  3 resolved, 0 unusable
 
 ✓ Symbol dependencies
   every imported symbol is provided
@@ -55,13 +55,13 @@ When everything checks out, the report says so and stops:
 
 ```text
 ✓ Architecture
-  x86-64, 64-bit            matches this system (x86-64)
+  x86-64, 64-bit            matches this system (x86-64, 64-bit)
 
 ✓ ELF interpreter
   /lib64/ld-linux-x86-64.so.2                    present
 
 ✓ Shared libraries
-  3 resolved, 0 missing
+  3 resolved, 0 unusable
 
 ✓ Symbol dependencies
   every imported symbol is provided
@@ -73,10 +73,11 @@ When everything checks out, the report says so and stops:
 
 | Check | What it means |
 | --- | --- |
-| **Architecture** | Compares `e_machine`/ELF class with the host, and flags 32-bit-on-64-bit setups that need multilib. |
-| **ELF interpreter** | Resolves `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`) and checks that it exists and is executable. Also handles shebang scripts. |
-| **Shared libraries** | Walks the transitive `DT_NEEDED` graph and resolves every library the way `ld.so` would: `DT_RPATH`, `LD_LIBRARY_PATH`, `DT_RUNPATH`, the `ld.so` cache, then the default directories. Missing libraries are reported with the object that required them. |
-| **Symbol dependencies** | Collects the global symbol scope of the whole dependency graph and reports imported (`STB_GLOBAL`, `SHN_UNDEF`) symbols that nobody defines — the "unresolved symbol" failure. |
+| **Executable permission** | An ELF program without any execute bit fails at launch with exit 126, so a missing `+x` is reported as a problem rather than a footnote. Plain shared libraries are exempt. |
+| **Architecture** | Compares `e_machine`/ELF class with the host. An exact mismatch is a failure, but a *compatible* one — 32-bit i386 on x86-64, for example — is a warning with a multilib hint rather than a false alarm. |
+| **ELF interpreter** | Resolves `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`) and checks that it exists and is executable. For shebang scripts, `#!/usr/bin/env foo` is resolved through `PATH`, not just as `/usr/bin/env`. |
+| **Shared libraries** | Walks the transitive `DT_NEEDED` graph and resolves every library the way `ld.so` would: `DT_RPATH`, `LD_LIBRARY_PATH`, `DT_RUNPATH`, the `ld.so` cache, then the default directories. A candidate only counts if its ELF class and machine match the object that needs it, so a 32-bit program is never handed the 64-bit `libc.so.6`; a name that resolves only to the wrong architecture is reported as `WRONG ARCH`. |
+| **Symbol dependencies** | Collects the global symbol scope of the whole dependency graph and reports imported (`STB_GLOBAL`, `SHN_UNDEF`) symbols that nobody defines. Imports are matched by name **and** symbol version where both are known, so `foo@OTHER` cannot satisfy an import of `foo@VER`. |
 | **Library versions** | Checks every `.gnu.version_r` requirement against the `.gnu.version_d` definitions of the library that must provide it, so it can say *"needs `GLIBC_2.99`, provides `GLIBC_2.44`"*. |
 | **Environment** | Flags `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_DEBUG`, because they silently change which libraries get loaded. |
 

@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::elf::{Binding, Class, ElfError, ElfFile, ElfType};
-use crate::resolve::{expand_dirs, Resolver};
+use crate::resolve::{expand_dirs, ElfIdentity, Resolver, SearchOutcome};
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,13 @@ pub struct ArchFinding {
     pub class: Class,
     /// `None` when the host architecture is not recognised.
     pub host_name: Option<&'static str>,
-    pub matches: bool,
+    /// Host word size in bits, when known.
+    pub host_bits: Option<u32>,
+    /// The host can run this program, natively or through a compatibility mode
+    /// (for example 32-bit i386 on an x86-64 kernel).
+    pub compatible: bool,
+    /// Same machine *and* word size as the host.
+    pub exact: bool,
 }
 
 /// The `PT_INTERP` (or shebang) interpreter.
@@ -87,10 +93,26 @@ pub struct InterpreterFinding {
     pub executable: bool,
 }
 
+/// Whether the file can actually be executed.
+#[derive(Debug, Clone)]
+pub struct PermissionFinding {
+    pub path: String,
+    pub executable: bool,
+    /// The permission bits, for a `mode 0644` style message.
+    pub mode: u32,
+}
+
 /// Where a `DT_NEEDED` object ended up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibResolution {
     Found(PathBuf),
+    /// A file with the right name exists, but it is built for another machine
+    /// or word size, so the loader cannot use it.
+    WrongArchitecture {
+        path: PathBuf,
+        found: &'static str,
+        wanted: &'static str,
+    },
     Missing,
 }
 
@@ -137,6 +159,7 @@ pub struct Analysis {
     pub path: PathBuf,
     pub kind: TargetKind,
     pub arch: Option<ArchFinding>,
+    pub permissions: Option<PermissionFinding>,
     pub interpreter: Option<InterpreterFinding>,
     pub libraries: Vec<LibraryFinding>,
     pub unresolved: Vec<UnresolvedSymbol>,
@@ -158,11 +181,24 @@ impl Analysis {
             .filter(|library| matches!(library.resolution, LibResolution::Missing))
     }
 
+    /// Libraries that cannot be used: missing, or present but wrong for this
+    /// machine.
+    pub fn unusable_libraries(&self) -> impl Iterator<Item = &LibraryFinding> {
+        self.libraries
+            .iter()
+            .filter(|library| !matches!(library.resolution, LibResolution::Found(_)))
+    }
+
     /// The number of concrete problems found.
     pub fn problem_count(&self) -> usize {
         let mut count = 0;
         if let Some(arch) = &self.arch {
-            if !arch.matches {
+            if !arch.compatible {
+                count += 1;
+            }
+        }
+        if let Some(permissions) = &self.permissions {
+            if !permissions.executable {
                 count += 1;
             }
         }
@@ -171,7 +207,7 @@ impl Analysis {
                 count += 1;
             }
         }
-        count += self.missing_libraries().count();
+        count += self.unusable_libraries().count();
         count += self.unresolved.len();
         count += self.version_problems.len();
         count
@@ -225,6 +261,7 @@ fn plain(path: &Path, description: String) -> Analysis {
         path: path.to_path_buf(),
         kind: TargetKind::NotElf { description },
         arch: None,
+        permissions: None,
         interpreter: None,
         libraries: Vec::new(),
         unresolved: Vec::new(),
@@ -258,28 +295,55 @@ fn analyze_script(path: &Path, data: &[u8]) -> Analysis {
     let first_line = data.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let line = String::from_utf8_lossy(first_line);
     let shebang = line.trim_start_matches("#!").trim();
-    let program = shebang.split_whitespace().next().unwrap_or("").to_string();
 
     let mut notes = Vec::new();
-    if shebang.starts_with("/usr/bin/env") || shebang.starts_with("env ") {
+    let via_env = is_env_shebang(shebang);
+    let command = if via_env {
+        // `#!/usr/bin/env perl` names a command, not a path: resolving it is
+        // the whole point of using env, so check PATH rather than /usr/bin/env.
         notes.push(
-            "the shebang uses `env`, so the real interpreter is resolved through PATH".to_string(),
+            "the shebang uses `env`, so the interpreter is resolved through PATH".to_string(),
         );
-    }
+        env_command(shebang)
+    } else {
+        shebang.split_whitespace().next().unwrap_or("").to_string()
+    };
 
     Analysis {
         path: path.to_path_buf(),
         kind: TargetKind::Script {
-            interpreter: program.clone(),
+            interpreter: command.clone(),
         },
         arch: None,
-        interpreter: Some(interpreter_finding(&program)),
+        permissions: permission_finding(path),
+        interpreter: Some(interpreter_finding(&command, via_env)),
         libraries: Vec::new(),
         unresolved: Vec::new(),
         version_problems: Vec::new(),
         env: env_findings(),
         notes,
     }
+}
+
+/// True for `#!/usr/bin/env ...` shebangs.
+fn is_env_shebang(shebang: &str) -> bool {
+    match shebang.split_whitespace().next() {
+        Some(program) => Path::new(program).file_name() == Some(std::ffi::OsStr::new("env")),
+        None => false,
+    }
+}
+
+/// The command named after `env`, skipping its options and `VAR=value` pairs.
+fn env_command(shebang: &str) -> String {
+    let mut fields = shebang.split_whitespace();
+    let _ = fields.next();
+    for field in fields {
+        if field.starts_with('-') || field.contains('=') {
+            continue;
+        }
+        return field.to_string();
+    }
+    String::new()
 }
 
 fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
@@ -292,26 +356,23 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
         ElfType::Core => notes.push("this is a core dump, not a program".to_string()),
         _ => {}
     }
-    if matches!(root.etype, ElfType::Executable | ElfType::Shared) && !is_executable(&canonical) {
-        notes.push("the file is not marked executable (try `chmod +x`)".to_string());
-    }
     if root.etype == ElfType::Executable && root.interpreter.is_none() && !root.has_dynamic {
         notes.push(
             "statically linked: no dynamic loader and no shared library dependencies".to_string(),
         );
     }
-    if root.class == Class::Elf32
-        && root.interpreter.is_some()
-        && crate::elf::host_machine() == Some(0x003e)
-    {
-        notes.push(
-            "32-bit program on a 64-bit x86-64 system: it needs the 32-bit loader and multilib libraries"
-                .to_string(),
-        );
-    }
 
     let arch = Some(arch_finding(&root));
-    let interpreter = root.interpreter.as_deref().map(interpreter_finding);
+    // A missing execute bit is a launch failure, not a footnote.
+    let permissions = if root.is_runnable() {
+        permission_finding(&canonical)
+    } else {
+        None
+    };
+    let interpreter = root
+        .interpreter
+        .as_deref()
+        .map(|path| interpreter_finding(path, false));
 
     // Breadth-first walk of the DT_NEEDED graph. Each object is parsed once and
     // reused for the symbol and version questions below.
@@ -348,34 +409,44 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
         let is_root = object_path == root_key;
         let (rpath, runpath) = load_dirs(&object, is_root, &root_rpath_global);
         for needed in &object.needed {
-            let found = resolver.search(needed, &rpath, &runpath);
+            // A DT_NEEDED name is only satisfied by an object of the same class
+            // and machine: a 32-bit program cannot load the 64-bit libc.so.6
+            // that happens to sit first in the cache.
+            let outcome = resolver.search(needed, Some(ElfIdentity::of(&object)), &rpath, &runpath);
+            let resolution = match &outcome {
+                SearchOutcome::Found(path) => LibResolution::Found(path.clone()),
+                SearchOutcome::WrongArchitecture(path, found) => LibResolution::WrongArchitecture {
+                    path: path.clone(),
+                    found: crate::elf::machine_name(found.machine),
+                    wanted: crate::elf::machine_name(object.machine),
+                },
+                SearchOutcome::Missing => LibResolution::Missing,
+            };
+
             match name_to_pos.get(needed).copied() {
                 Some(index) => {
                     let parent = label(&object_path);
                     if !libraries[index].needed_by.contains(&parent) {
                         libraries[index].needed_by.push(parent);
                     }
-                    match (&libraries[index].resolution, &found) {
-                        (LibResolution::Missing, Some(path)) => {
-                            libraries[index].resolution = LibResolution::Found(path.clone())
-                        }
-                        (LibResolution::Found(previous), Some(path))
-                            if canonical_key(previous) != canonical_key(path) =>
-                        {
+                    if let (LibResolution::Found(previous), LibResolution::Found(current)) =
+                        (&libraries[index].resolution, &resolution)
+                    {
+                        if canonical_key(previous) != canonical_key(current) {
                             notes.push(format!(
                                 "{needed} resolves to more than one file ({} and {})",
                                 previous.display(),
-                                path.display()
+                                current.display()
                             ));
                         }
-                        _ => {}
+                    }
+                    // Prefer the most usable outcome seen so far.
+                    if resolution_rank(&resolution) > resolution_rank(&libraries[index].resolution)
+                    {
+                        libraries[index].resolution = resolution;
                     }
                 }
                 None => {
-                    let resolution = match &found {
-                        Some(path) => LibResolution::Found(path.clone()),
-                        None => LibResolution::Missing,
-                    };
                     name_to_pos.insert(needed.clone(), libraries.len());
                     libraries.push(LibraryFinding {
                         name: needed.clone(),
@@ -385,8 +456,10 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
                 }
             }
 
-            if let Some(path) = found {
-                let key = canonical_key(&path);
+            // Only a usable object can contribute symbols and versions, so only
+            // a usable object is parsed and walked any further.
+            if let SearchOutcome::Found(path) = &outcome {
+                let key = canonical_key(path);
                 if !parsed.contains_key(&key) {
                     match ElfFile::parse(&key) {
                         Ok(library) => {
@@ -404,12 +477,27 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
         }
     }
 
-    // A symbol is resolved if *any* object in the graph defines it: that is the
-    // global scope the loader builds before relocating.
-    let mut provided: HashSet<&str> = HashSet::new();
+    // A symbol is resolved if some object in the graph defines it: that is the
+    // global scope the loader builds before relocating. Definitions are matched
+    // by name *and* version where both are known, so `foo@OTHER` cannot satisfy
+    // an import of `foo@VER`.
+    let mut provided_names: HashSet<&str> = HashSet::new();
+    let mut unversioned_defs: HashSet<&str> = HashSet::new();
+    let mut provided_versions: HashSet<(&str, &str)> = HashSet::new();
     for key in &order {
-        for symbol in parsed[key].symbols.iter().filter(|s| s.satisfies()) {
-            provided.insert(symbol.name.as_str());
+        let object = &parsed[key];
+        for symbol in object.symbols.iter().filter(|s| s.satisfies()) {
+            provided_names.insert(symbol.name.as_str());
+            match object.defined_version_name(symbol.version_index) {
+                Some(version) => {
+                    provided_versions.insert((symbol.name.as_str(), version));
+                }
+                // Index 1 (global/base), or a version we could not name, is
+                // treated as unversioned: it may satisfy a versioned import.
+                None => {
+                    unversioned_defs.insert(symbol.name.as_str());
+                }
+            }
         }
     }
 
@@ -422,17 +510,28 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
             if !symbol.undefined || !matches!(symbol.binding, Binding::Global) {
                 continue;
             }
-            if provided.contains(symbol.name.as_str()) {
+            let version = object.version_name(symbol.version_index);
+            let satisfied = match version {
+                Some(version) => {
+                    provided_versions.contains(&(symbol.name.as_str(), version))
+                        || unversioned_defs.contains(symbol.name.as_str())
+                }
+                // An unversioned reference binds to any definition of the name.
+                None => provided_names.contains(symbol.name.as_str()),
+            };
+            if satisfied {
                 continue;
             }
-            if !seen_symbols.insert((key.clone(), symbol.name.clone())) {
+            if !seen_symbols.insert((
+                key.clone(),
+                symbol.name.clone(),
+                version.map(str::to_string),
+            )) {
                 continue;
             }
             unresolved.push(UnresolvedSymbol {
                 name: symbol.name.clone(),
-                version: object
-                    .version_name(symbol.version_index)
-                    .map(str::to_string),
+                version: version.map(str::to_string),
                 object: label(key),
             });
         }
@@ -479,6 +578,7 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
         path: display.to_path_buf(),
         kind: TargetKind::Elf(root),
         arch,
+        permissions,
         interpreter,
         libraries,
         unresolved,
@@ -508,24 +608,94 @@ fn load_dirs(
     (rpath, runpath)
 }
 
+/// Orders library outcomes by usefulness, so a good result is never replaced
+/// by a worse one discovered later through another object.
+fn resolution_rank(resolution: &LibResolution) -> u8 {
+    match resolution {
+        LibResolution::Found(_) => 2,
+        LibResolution::WrongArchitecture { .. } => 1,
+        LibResolution::Missing => 0,
+    }
+}
+
 fn arch_finding(elf: &ElfFile) -> ArchFinding {
     let host = crate::elf::host_machine();
+    let host_bits = host.map(|_| (std::mem::size_of::<usize>() * 8) as u32);
+    let exact = host == Some(elf.machine) && host_bits == Some(elf.class.bits());
+    // An unrecognised host is not evidence of a problem; a 32-bit program on a
+    // 64-bit kernel is compatible even though the machines differ.
+    let compatible = match host {
+        Some(machine) => machine == elf.machine || runs_compatibly(machine, elf.machine),
+        None => true,
+    };
     ArchFinding {
         name: crate::elf::machine_name(elf.machine),
         class: elf.class,
         host_name: host.map(crate::elf::machine_name),
-        // An unrecognised host is not evidence of a problem.
-        matches: host.map_or(true, |machine| machine == elf.machine),
+        host_bits,
+        compatible,
+        exact,
     }
 }
 
-fn interpreter_finding(path: &str) -> InterpreterFinding {
-    let candidate = Path::new(path);
+/// Machine pairs whose host CPU can execute the target's code directly.
+fn runs_compatibly(host: u16, target: u16) -> bool {
+    matches!(
+        (host, target),
+        (0x003e, 0x0003) // x86-64 runs i386
+            | (0x00b7, 0x0028) // AArch64 runs AArch32
+            | (0x0015, 0x0014) // PowerPC64 runs 32-bit PowerPC
+    )
+}
+
+fn interpreter_finding(command: &str, via_path: bool) -> InterpreterFinding {
+    if via_path {
+        return match find_on_path(command) {
+            Some(found) => InterpreterFinding {
+                path: found.display().to_string(),
+                exists: true,
+                executable: true,
+            },
+            None => InterpreterFinding {
+                path: command.to_string(),
+                exists: false,
+                executable: false,
+            },
+        };
+    }
+    let candidate = Path::new(command);
     InterpreterFinding {
-        path: path.to_string(),
+        path: command.to_string(),
         exists: candidate.exists(),
         executable: is_executable(candidate),
     }
+}
+
+/// Resolves a bare command name through `PATH`, the way a shell would.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains('/') {
+        let candidate = Path::new(name);
+        return (candidate.is_file() && is_executable(candidate)).then(|| candidate.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        (candidate.is_file() && is_executable(&candidate)).then_some(candidate)
+    })
+}
+
+fn permission_finding(path: &Path) -> Option<PermissionFinding> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).ok()?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    Some(PermissionFinding {
+        path: path.display().to_string(),
+        executable: mode & 0o111 != 0,
+        mode,
+    })
 }
 
 fn env_findings() -> Vec<EnvFinding> {
@@ -648,5 +818,14 @@ mod tests {
             Some("GLIBC_2.41")
         );
         assert_eq!(best_provided(&provided, "GLIBC_PRIVATE"), None);
+    }
+
+    #[test]
+    fn recognises_compatible_machines() {
+        // 32-bit i386 runs on an x86-64 kernel; the reverse does not hold.
+        assert!(runs_compatibly(0x003e, 0x0003));
+        assert!(runs_compatibly(0x00b7, 0x0028));
+        assert!(!runs_compatibly(0x0003, 0x003e));
+        assert!(!runs_compatibly(0x003e, 0x00b7));
     }
 }

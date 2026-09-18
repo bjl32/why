@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal};
 
 use crate::analyze::{
-    Analysis, ArchFinding, LibResolution, LibraryFinding, Status, TargetKind, UnresolvedSymbol,
-    VersionProblem,
+    Analysis, ArchFinding, LibResolution, LibraryFinding, PermissionFinding, Status, TargetKind,
+    UnresolvedSymbol, VersionProblem,
 };
 use crate::cli::Options;
 use crate::distro::Distro;
@@ -175,6 +175,9 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
         return;
     }
 
+    if let Some(permissions) = &analysis.permissions {
+        render_permissions(out, permissions, options, painter);
+    }
     if let Some(arch) = &analysis.arch {
         render_arch(out, arch, options, painter);
     }
@@ -188,23 +191,46 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
     let _ = writeln!(out, "{}", summary_line(analysis, options, painter));
 }
 
+fn render_permissions(
+    out: &mut String,
+    permissions: &PermissionFinding,
+    options: &Options,
+    painter: &Painter,
+) {
+    let status = if permissions.executable {
+        Status::Ok
+    } else {
+        Status::Fail
+    };
+    section(out, painter, status, "Executable permission", options.ascii);
+    let value = if permissions.executable {
+        "executable".to_string()
+    } else {
+        format!("not executable (mode {:04o})", permissions.mode)
+    };
+    let _ = writeln!(out, "{}", row(painter, &permissions.path, &value, status));
+    let _ = writeln!(out);
+}
+
 fn render_arch(out: &mut String, arch: &ArchFinding, options: &Options, painter: &Painter) {
     let bits = match arch.class {
         Class::Elf32 => 32,
         Class::Elf64 => 64,
     };
     let label = format!("{}, {bits}-bit", arch.name);
-    let (status, value) = if arch.matches {
-        let value = match arch.host_name {
-            Some(host) => format!("matches this system ({host})"),
-            None => "host architecture unknown".to_string(),
-        };
-        (Status::Ok, value)
-    } else {
-        (
-            Status::Fail,
-            format!("this system is {}", arch.host_name.unwrap_or("unknown")),
-        )
+    // A different machine is not automatically broken: 32-bit i386 runs on
+    // x86-64, it just needs the compatibility loader and libraries.
+    let (status, value) = match arch.host_name {
+        None => (Status::Info, "host architecture unknown".to_string()),
+        Some(host) if arch.exact => (
+            Status::Ok,
+            format!("matches this system ({host}, {bits}-bit)"),
+        ),
+        Some(host) if arch.compatible => (
+            Status::Warn,
+            format!("compatible with {host} (needs multilib support)"),
+        ),
+        Some(host) => (Status::Fail, format!("this system is {host}")),
     };
     section(out, painter, status, "Architecture", options.ascii);
     let _ = writeln!(out, "{}", row(painter, &label, &value, status));
@@ -234,7 +260,8 @@ fn render_interpreter(out: &mut String, analysis: &Analysis, options: &Options, 
     let (status, value) = if !interpreter.exists {
         (Status::Fail, "MISSING")
     } else if !interpreter.executable {
-        (Status::Warn, "not executable")
+        // A loader without the execute bit cannot start anything.
+        (Status::Fail, "not executable")
     } else {
         (Status::Ok, "present")
     };
@@ -260,22 +287,42 @@ fn render_libraries(out: &mut String, analysis: &Analysis, options: &Options, pa
         return;
     }
 
-    let missing: Vec<&LibraryFinding> = analysis.missing_libraries().collect();
-    let resolved = analysis.libraries.len() - missing.len();
-    let status = if missing.is_empty() {
+    let unusable: Vec<&LibraryFinding> = analysis.unusable_libraries().collect();
+    let resolved = analysis.libraries.len() - unusable.len();
+    let status = if unusable.is_empty() {
         Status::Ok
     } else {
         Status::Fail
     };
 
     section(out, painter, status, "Shared libraries", options.ascii);
-    let _ = writeln!(out, "  {resolved} resolved, {} missing", missing.len());
-    for library in &missing {
-        let _ = writeln!(
-            out,
-            "{}",
-            row(painter, &library.name, "MISSING", Status::Fail)
-        );
+    let _ = writeln!(out, "  {resolved} resolved, {} unusable", unusable.len());
+    for library in &unusable {
+        match &library.resolution {
+            LibResolution::WrongArchitecture {
+                path,
+                found,
+                wanted,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    row(painter, &library.name, "WRONG ARCH", Status::Fail)
+                );
+                let _ = writeln!(
+                    out,
+                    "      found {} ({found}), but a {wanted} object is required",
+                    path.display()
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    row(painter, &library.name, "MISSING", Status::Fail)
+                );
+            }
+        }
         for parent in &library.needed_by {
             let _ = writeln!(out, "      required by {parent}");
         }
@@ -478,6 +525,15 @@ fn render_suggestions(out: &mut String, analysis: &Analysis, painter: &Painter) 
 fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
     let mut steps: Vec<String> = Vec::new();
 
+    if let Some(permissions) = &analysis.permissions {
+        if !permissions.executable {
+            steps.push(format!(
+                "Make the file executable: `chmod +x {}` (currently mode {:04o})",
+                permissions.path, permissions.mode
+            ));
+        }
+    }
+
     for library in analysis.missing_libraries() {
         let step = format!(
             "Find and install the package that provides {} — {}",
@@ -489,9 +545,32 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
         }
     }
 
+    for library in analysis.unusable_libraries() {
+        if let LibResolution::WrongArchitecture {
+            path,
+            found,
+            wanted,
+        } = &library.resolution
+        {
+            let step = format!(
+                "{} ({}) is built for {found}, not {wanted}; install the {wanted} version of the package that provides it",
+                library.name,
+                path.display()
+            );
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+    }
+
     if let Some(interpreter) = &analysis.interpreter {
         if !interpreter.exists {
             let message = match analysis.kind {
+                // A bare name (from `#!/usr/bin/env`) is a PATH lookup, not a path.
+                TargetKind::Script { .. } if !interpreter.path.contains('/') => format!(
+                    "The interpreter `{}` was not found on PATH; install it or fix PATH",
+                    interpreter.path
+                ),
                 TargetKind::Script { .. } => format!(
                     "The interpreter {} named on line 1 of the script does not exist; install whatever provides it",
                     interpreter.path
@@ -505,12 +584,17 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
         }
     }
     if let Some(arch) = &analysis.arch {
-        if !arch.matches {
+        if !arch.compatible {
             steps.push(format!(
-                "This program targets {} but the system is {}; install the matching runtime or enable multilib",
+                "This program targets {} but the system is {}; install the matching runtime",
                 arch.name,
                 arch.host_name.unwrap_or("unknown")
             ));
+        } else if !arch.exact {
+            steps.push(
+                "This is a cross-architecture (for example 32-bit) program: it needs the compatibility loader and multilib libraries installed"
+                    .to_string(),
+            );
         }
     }
     if !analysis.unresolved.is_empty() {
