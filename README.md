@@ -108,6 +108,9 @@ or install it:
 $ cargo install --path .
 ```
 
+On Arch, an AUR package lives in [`packaging/aur/`](packaging/aur); see its
+README for the publish steps.
+
 ## Usage
 
 ```text
