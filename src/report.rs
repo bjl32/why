@@ -175,6 +175,9 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
         return;
     }
 
+    if let Some(not_a_program) = &analysis.not_a_program {
+        render_file_type(out, not_a_program, analysis, options, painter);
+    }
     if let Some(permissions) = &analysis.permissions {
         render_permissions(out, permissions, options, painter);
     }
@@ -189,6 +192,28 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
     render_notes(out, analysis, painter);
     render_suggestions(out, analysis, painter);
     let _ = writeln!(out, "{}", summary_line(analysis, options, painter));
+}
+
+fn render_file_type(
+    out: &mut String,
+    reason: &str,
+    analysis: &Analysis,
+    options: &Options,
+    painter: &Painter,
+) {
+    section(out, painter, Status::Fail, "File type", options.ascii);
+    let _ = writeln!(
+        out,
+        "{}",
+        row(
+            painter,
+            &analysis.path.display().to_string(),
+            "not runnable",
+            Status::Fail
+        )
+    );
+    let _ = writeln!(out, "      {reason}");
+    let _ = writeln!(out);
 }
 
 fn render_permissions(
@@ -262,11 +287,17 @@ fn render_interpreter(out: &mut String, analysis: &Analysis, options: &Options, 
     } else if !interpreter.executable {
         // A loader without the execute bit cannot start anything.
         (Status::Fail, "not executable")
+    } else if interpreter.wrong_architecture.is_some() {
+        // The kernel rejects a loader of the wrong class or machine.
+        (Status::Fail, "wrong architecture")
     } else {
         (Status::Ok, "present")
     };
     section(out, painter, status, title, options.ascii);
     let _ = writeln!(out, "{}", row(painter, &interpreter.path, value, status));
+    if let Some((found, wanted)) = interpreter.wrong_architecture {
+        let _ = writeln!(out, "      built for {found}, but the program is {wanted}");
+    }
     let _ = writeln!(out);
 }
 
@@ -314,6 +345,14 @@ fn render_libraries(out: &mut String, analysis: &Analysis, options: &Options, pa
                     "      found {} ({found}), but a {wanted} object is required",
                     path.display()
                 );
+            }
+            LibResolution::Unusable { path, reason } => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    row(painter, &library.name, "UNUSABLE", Status::Fail)
+                );
+                let _ = writeln!(out, "      {} is {reason}", path.display());
             }
             _ => {
                 let _ = writeln!(
@@ -525,6 +564,13 @@ fn render_suggestions(out: &mut String, analysis: &Analysis, painter: &Painter) 
 fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
     let mut steps: Vec<String> = Vec::new();
 
+    if analysis.not_a_program.is_some() {
+        steps.push(
+            "Point `why` at the program that runs this file (the executable or the loader), not at the object itself"
+                .to_string(),
+        );
+    }
+
     if let Some(permissions) = &analysis.permissions {
         if !permissions.executable {
             steps.push(format!(
@@ -561,6 +607,16 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
                 steps.push(step);
             }
         }
+        if let LibResolution::Unusable { path, reason } = &library.resolution {
+            let step = format!(
+                "{} ({}) is {reason}; replace it or remove it from the search path",
+                library.name,
+                path.display()
+            );
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
     }
 
     if let Some(interpreter) = &analysis.interpreter {
@@ -582,19 +638,28 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
             };
             steps.push(message);
         }
-    }
-    if let Some(arch) = &analysis.arch {
-        if !arch.compatible {
+        if let Some((found, wanted)) = interpreter.wrong_architecture {
             steps.push(format!(
-                "This program targets {} but the system is {}; install the matching runtime",
-                arch.name,
-                arch.host_name.unwrap_or("unknown")
+                "The ELF interpreter {} is built for {found} but the program is {wanted}; the loader path is wrong (reinstall the program or the C library)",
+                interpreter.path
             ));
-        } else if !arch.exact {
-            steps.push(
-                "This is a cross-architecture (for example 32-bit) program: it needs the compatibility loader and multilib libraries installed"
-                    .to_string(),
-            );
+        }
+    }
+    // Architecture advice is noise for something that is not a program.
+    if analysis.not_a_program.is_none() {
+        if let Some(arch) = &analysis.arch {
+            if !arch.compatible {
+                steps.push(format!(
+                    "This program targets {} but the system is {}; install the matching runtime",
+                    arch.name,
+                    arch.host_name.unwrap_or("unknown")
+                ));
+            } else if !arch.exact {
+                steps.push(
+                    "This is a cross-architecture (for example 32-bit) program: it needs the compatibility loader and multilib libraries installed"
+                        .to_string(),
+                );
+            }
         }
     }
     if !analysis.unresolved.is_empty() {

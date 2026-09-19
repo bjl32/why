@@ -253,3 +253,62 @@ fn verbose_lists_resolved_libraries() {
     assert!(stdout.contains("libc.so.6"), "{stdout}");
     assert!(stdout.contains("Library versions"), "{stdout}");
 }
+
+#[test]
+fn reports_a_non_program_as_a_problem() {
+    // A relocatable object cannot be run, so it must not end with
+    // "no problems found" and exit 0.
+    let candidates = ["/usr/lib/crt1.o", "/usr/lib32/crt1.o", "/lib/crt1.o"];
+    let Some(object) = candidates.iter().find(|path| Path::new(path).exists()) else {
+        return;
+    };
+
+    let output = run(&["--no-color", object]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("not runnable"), "{stdout}");
+    assert!(!stdout.contains("no problems found"), "{stdout}");
+}
+
+#[test]
+fn skips_env_options_in_a_shebang() {
+    let dir = temp_dir("env-options");
+    let script = dir.join("script");
+    fs::write(&script, b"#!/usr/bin/env -u FOO why-no-such-interpreter\n").unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let output = run(&["--no-color", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    // The command after `-u FOO` must be reported, not the option's argument.
+    assert!(stdout.contains("why-no-such-interpreter"), "{stdout}");
+    assert!(!stdout.contains("FOO"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_non_elf_library_is_not_reported_as_resolved() {
+    let dir = temp_dir("decoy-lib");
+    let Some((path, bogus)) = make_broken_binary(&dir) else {
+        return;
+    };
+    // Put a same-named text file on the search path: the loader cannot use it,
+    // so it must not count as "resolved".
+    let libdir = dir.join("libdir");
+    fs::create_dir_all(&libdir).unwrap();
+    fs::write(libdir.join(&bogus), b"not an ELF object\n").unwrap();
+
+    let output = Command::new(why_binary())
+        .env("LD_LIBRARY_PATH", &libdir)
+        .args(["--no-color", path.to_str().unwrap()])
+        .output()
+        .expect("run why");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("UNUSABLE"), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}

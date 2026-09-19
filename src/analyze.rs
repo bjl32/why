@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::elf::{Binding, Class, ElfError, ElfFile, ElfType};
-use crate::resolve::{expand_dirs, ElfIdentity, Resolver, SearchOutcome};
+use crate::resolve::{expand_dirs, identify, ElfIdentity, Resolver, SearchOutcome};
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,9 @@ pub struct InterpreterFinding {
     pub path: String,
     pub exists: bool,
     pub executable: bool,
+    /// `Some((found, wanted))` when the interpreter is an ELF object built for
+    /// a different class or machine than the program it has to load.
+    pub wrong_architecture: Option<(&'static str, &'static str)>,
 }
 
 /// Whether the file can actually be executed.
@@ -112,6 +115,11 @@ pub enum LibResolution {
         path: PathBuf,
         found: &'static str,
         wanted: &'static str,
+    },
+    /// A file with the right name exists, but it is not a loadable ELF object.
+    Unusable {
+        path: PathBuf,
+        reason: String,
     },
     Missing,
 }
@@ -158,6 +166,9 @@ pub struct EnvFinding {
 pub struct Analysis {
     pub path: PathBuf,
     pub kind: TargetKind,
+    /// Set when the target cannot be run at all (a relocatable object or a core
+    /// dump). The message explains what it actually is.
+    pub not_a_program: Option<String>,
     pub arch: Option<ArchFinding>,
     pub permissions: Option<PermissionFinding>,
     pub interpreter: Option<InterpreterFinding>,
@@ -192,6 +203,9 @@ impl Analysis {
     /// The number of concrete problems found.
     pub fn problem_count(&self) -> usize {
         let mut count = 0;
+        if self.not_a_program.is_some() {
+            count += 1;
+        }
         if let Some(arch) = &self.arch {
             if !arch.compatible {
                 count += 1;
@@ -203,7 +217,10 @@ impl Analysis {
             }
         }
         if let Some(interpreter) = &self.interpreter {
-            if !interpreter.exists || !interpreter.executable {
+            if !interpreter.exists
+                || !interpreter.executable
+                || interpreter.wrong_architecture.is_some()
+            {
                 count += 1;
             }
         }
@@ -260,6 +277,7 @@ fn plain(path: &Path, description: String) -> Analysis {
     Analysis {
         path: path.to_path_buf(),
         kind: TargetKind::NotElf { description },
+        not_a_program: None,
         arch: None,
         permissions: None,
         interpreter: None,
@@ -314,6 +332,7 @@ fn analyze_script(path: &Path, data: &[u8]) -> Analysis {
         kind: TargetKind::Script {
             interpreter: command.clone(),
         },
+        not_a_program: None,
         arch: None,
         permissions: permission_finding(path),
         interpreter: Some(interpreter_finding(&command, via_env)),
@@ -334,11 +353,59 @@ fn is_env_shebang(shebang: &str) -> bool {
 }
 
 /// The command named after `env`, skipping its options and `VAR=value` pairs.
+///
+/// `env` options are not uniform: `-u`/`--unset` and `-C`/`--chdir` take a
+/// separate value, so that value must be consumed too or it is mistaken for the
+/// interpreter (`env -u FOO python3`). Short options may attach their value
+/// (`-uFOO`, `-C/tmp`), and `VAR=value` assignments precede the command.
 fn env_command(shebang: &str) -> String {
     let mut fields = shebang.split_whitespace();
     let _ = fields.next();
+    let mut expect_value = false;
+    let mut options_done = false;
+
     for field in fields {
-        if field.starts_with('-') || field.contains('=') {
+        if expect_value {
+            expect_value = false;
+            continue;
+        }
+        if options_done {
+            return field.to_string();
+        }
+        if field == "--" {
+            options_done = true;
+            continue;
+        }
+        if let Some(value) = field.strip_prefix("--split-string=") {
+            // The rest of the option is the command line to split.
+            return value
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+        }
+        if field.starts_with("--") {
+            // The long forms of the value-taking options are the exception;
+            // `--unset=NAME` carries its value inline and needs no lookahead.
+            let name = field.split('=').next().unwrap_or(field);
+            if !field.contains('=') && matches!(name, "--unset" | "--chdir") {
+                expect_value = true;
+            }
+            continue;
+        }
+        if field.starts_with('-') && field.len() > 1 {
+            // Walk the short-option cluster; `u` and `C` consume a value.
+            let mut chars = field[1..].chars().peekable();
+            while let Some(flag) = chars.next() {
+                if flag == 'u' || flag == 'C' {
+                    expect_value = chars.peek().is_none();
+                    break;
+                }
+            }
+            continue;
+        }
+        // A `VAR=value` assignment comes before the command.
+        if field.contains('=') {
             continue;
         }
         return field.to_string();
@@ -350,12 +417,15 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     let root = Box::new(elf);
     let mut notes = Vec::new();
 
-    match root.etype {
-        ElfType::Relocatable => notes
-            .push("this is a relocatable object (.o), not something that can be run".to_string()),
-        ElfType::Core => notes.push("this is a core dump, not a program".to_string()),
-        _ => {}
-    }
+    // A relocatable object or a core dump is not a program at all: saying
+    // "no problems found" for one would contradict the report itself.
+    let not_a_program = match root.etype {
+        ElfType::Relocatable => {
+            Some("this is a relocatable object (.o), not something that can be run".to_string())
+        }
+        ElfType::Core => Some("this is a core dump, not a program".to_string()),
+        _ => None,
+    };
     if root.etype == ElfType::Executable && root.interpreter.is_none() && !root.has_dynamic {
         notes.push(
             "statically linked: no dynamic loader and no shared library dependencies".to_string(),
@@ -369,10 +439,18 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     } else {
         None
     };
-    let interpreter = root
-        .interpreter
-        .as_deref()
-        .map(|path| interpreter_finding(path, false));
+    let interpreter = root.interpreter.as_deref().map(|path| {
+        let mut finding = interpreter_finding(path, false);
+        // The kernel rejects a loader built for another class or machine before
+        // it ever reaches the library search path.
+        if finding.exists && finding.executable {
+            if let Ok(loader) = identify(Path::new(path)) {
+                finding.wrong_architecture =
+                    interpreter_arch_mismatch(root.machine, root.class, &loader);
+            }
+        }
+        finding
+    });
 
     // Breadth-first walk of the DT_NEEDED graph. Each object is parsed once and
     // reused for the symbol and version questions below.
@@ -385,6 +463,7 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     };
 
     let mut parsed: HashMap<PathBuf, Box<ElfFile>> = HashMap::new();
+    let mut attempted: HashSet<PathBuf> = HashSet::new();
     let mut order: Vec<PathBuf> = Vec::new();
     let mut queue: VecDeque<(PathBuf, Box<ElfFile>)> = VecDeque::new();
     parsed.insert(root_key.clone(), root.clone());
@@ -419,6 +498,10 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
                     path: path.clone(),
                     found: crate::elf::machine_name(found.machine),
                     wanted: crate::elf::machine_name(object.machine),
+                },
+                SearchOutcome::Unusable(path, reason) => LibResolution::Unusable {
+                    path: path.clone(),
+                    reason: (*reason).to_string(),
                 },
                 SearchOutcome::Missing => LibResolution::Missing,
             };
@@ -460,7 +543,9 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
             // a usable object is parsed and walked any further.
             if let SearchOutcome::Found(path) = &outcome {
                 let key = canonical_key(path);
-                if !parsed.contains_key(&key) {
+                // `attempted` also remembers failures, so a broken library is
+                // not re-read once per object that needs it.
+                if attempted.insert(key.clone()) {
                     match ElfFile::parse(&key) {
                         Ok(library) => {
                             let library = Box::new(library);
@@ -469,7 +554,21 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
                             queue.push_back((key, library));
                         }
                         Err(error) => {
-                            notes.push(format!("could not read {}: {error}", path.display()))
+                            let reason = format!("could not be parsed ({error})");
+                            notes.push(format!("could not read {}: {error}", path.display()));
+                            // An identifiable header that will not parse is still
+                            // not loadable; downgrade it so the report and the
+                            // exit status say so.
+                            if let Some(index) = name_to_pos.get(needed).copied() {
+                                let still_this = matches!(
+                                    &libraries[index].resolution,
+                                    LibResolution::Found(found) if canonical_key(found) == key
+                                );
+                                if still_this {
+                                    libraries[index].resolution =
+                                        LibResolution::Unusable { path: key, reason };
+                                }
+                            }
                         }
                     }
                 }
@@ -577,6 +676,7 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     Analysis {
         path: display.to_path_buf(),
         kind: TargetKind::Elf(root),
+        not_a_program,
         arch,
         permissions,
         interpreter,
@@ -612,8 +712,9 @@ fn load_dirs(
 /// by a worse one discovered later through another object.
 fn resolution_rank(resolution: &LibResolution) -> u8 {
     match resolution {
-        LibResolution::Found(_) => 2,
-        LibResolution::WrongArchitecture { .. } => 1,
+        LibResolution::Found(_) => 3,
+        LibResolution::WrongArchitecture { .. } => 2,
+        LibResolution::Unusable { .. } => 1,
         LibResolution::Missing => 0,
     }
 }
@@ -621,13 +722,7 @@ fn resolution_rank(resolution: &LibResolution) -> u8 {
 fn arch_finding(elf: &ElfFile) -> ArchFinding {
     let host = crate::elf::host_machine();
     let host_bits = host.map(|_| (std::mem::size_of::<usize>() * 8) as u32);
-    let exact = host == Some(elf.machine) && host_bits == Some(elf.class.bits());
-    // An unrecognised host is not evidence of a problem; a 32-bit program on a
-    // 64-bit kernel is compatible even though the machines differ.
-    let compatible = match host {
-        Some(machine) => machine == elf.machine || runs_compatibly(machine, elf.machine),
-        None => true,
-    };
+    let (compatible, exact) = arch_compatibility(host, host_bits, elf.machine, elf.class.bits());
     ArchFinding {
         name: crate::elf::machine_name(elf.machine),
         class: elf.class,
@@ -635,6 +730,48 @@ fn arch_finding(elf: &ElfFile) -> ArchFinding {
         host_bits,
         compatible,
         exact,
+    }
+}
+
+/// Decides whether a target can run on a host, and whether it matches exactly.
+///
+/// A target wider than the host process can never run, even when `e_machine` is
+/// shared across word sizes (MIPS and RISC-V use one value for both 32- and
+/// 64-bit). Narrower targets may run through compatibility support; the
+/// interpreter check catches a missing loader.
+fn arch_compatibility(
+    host: Option<u16>,
+    host_bits: Option<u32>,
+    machine: u16,
+    bits: u32,
+) -> (bool, bool) {
+    let exact = host == Some(machine) && host_bits == Some(bits);
+    let compatible = match host {
+        Some(host_machine) => {
+            let width_ok = match host_bits {
+                Some(host_width) => bits <= host_width,
+                None => true,
+            };
+            width_ok && (host_machine == machine || runs_compatibly(host_machine, machine))
+        }
+        None => true,
+    };
+    (compatible, exact)
+}
+
+/// Names the architecture mismatch between a program and its loader, if any.
+fn interpreter_arch_mismatch(
+    program_machine: u16,
+    program_class: Class,
+    loader: &ElfIdentity,
+) -> Option<(&'static str, &'static str)> {
+    if loader.machine != program_machine || loader.class != program_class {
+        Some((
+            crate::elf::machine_name(loader.machine),
+            crate::elf::machine_name(program_machine),
+        ))
+    } else {
+        None
     }
 }
 
@@ -655,11 +792,13 @@ fn interpreter_finding(command: &str, via_path: bool) -> InterpreterFinding {
                 path: found.display().to_string(),
                 exists: true,
                 executable: true,
+                wrong_architecture: None,
             },
             None => InterpreterFinding {
                 path: command.to_string(),
                 exists: false,
                 executable: false,
+                wrong_architecture: None,
             },
         };
     }
@@ -668,6 +807,7 @@ fn interpreter_finding(command: &str, via_path: bool) -> InterpreterFinding {
         path: command.to_string(),
         exists: candidate.exists(),
         executable: is_executable(candidate),
+        wrong_architecture: None,
     }
 }
 
@@ -827,5 +967,53 @@ mod tests {
         assert!(runs_compatibly(0x00b7, 0x0028));
         assert!(!runs_compatibly(0x0003, 0x003e));
         assert!(!runs_compatibly(0x003e, 0x00b7));
+    }
+
+    #[test]
+    fn a_wider_target_is_not_compatible_with_a_narrower_host() {
+        // MIPS and RISC-V use one e_machine for both word sizes, so the class
+        // has to decide: a 64-bit target cannot run on a 32-bit host process.
+        let riscv = 0x00f3;
+        assert!(arch_compatibility(Some(riscv), Some(64), riscv, 32).0);
+        assert!(!arch_compatibility(Some(riscv), Some(32), riscv, 64).0);
+        assert!(arch_compatibility(Some(riscv), Some(64), riscv, 64).1);
+
+        // The classic x86 pair is unaffected.
+        assert!(arch_compatibility(Some(0x003e), Some(64), 0x0003, 32).0);
+        assert!(!arch_compatibility(Some(0x003e), Some(64), 0x00b7, 64).0);
+    }
+
+    #[test]
+    fn detects_a_loader_of_the_wrong_architecture() {
+        let loader = ElfIdentity {
+            class: Class::Elf64,
+            machine: 0x003e,
+        };
+        // A 32-bit program with a 64-bit loader is broken.
+        assert!(interpreter_arch_mismatch(0x0003, Class::Elf32, &loader).is_some());
+        // Same machine and class is fine.
+        assert!(interpreter_arch_mismatch(0x003e, Class::Elf64, &loader).is_none());
+        // Same machine but the wrong word size (x32-style) is still a mismatch.
+        assert!(interpreter_arch_mismatch(0x003e, Class::Elf32, &loader).is_some());
+    }
+
+    #[test]
+    fn skips_env_options_when_finding_the_interpreter() {
+        assert_eq!(env_command("/usr/bin/env python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -u FOO python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -C /tmp python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -uFOO python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -C/tmp python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env --unset FOO python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env --unset=FOO python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env --chdir /tmp python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env VAR=1 python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -S python3 -u"), "python3");
+        assert_eq!(
+            env_command("/usr/bin/env --split-string=python3 -u"),
+            "python3"
+        );
+        assert_eq!(env_command("/usr/bin/env -i python3"), "python3");
+        assert_eq!(env_command("/usr/bin/env -- python3"), "python3");
     }
 }
