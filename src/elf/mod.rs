@@ -55,10 +55,14 @@ const DT_SYMENT: i64 = 11;
 const DT_SONAME: i64 = 14;
 const DT_RPATH: i64 = 15;
 const DT_RUNPATH: i64 = 29;
+const DT_FLAGS_1: i64 = 0x6fff_fffb;
 const DT_GNU_HASH: i64 = 0x6fff_fef5;
 const DT_VERSYM: i64 = 0x6fff_fff0;
 const DT_VERDEF: i64 = 0x6fff_fffc;
 const DT_VERNEED: i64 = 0x6fff_fffe;
+
+/// `DF_1_PIE`: this `ET_DYN` object is a position-independent executable.
+const DF_1_PIE: u64 = 0x0800_0000;
 
 // Section indices and symbol attributes.
 const SHN_UNDEF: u16 = 0;
@@ -249,6 +253,8 @@ pub struct ElfFile {
     pub runpath: Vec<String>,
     /// True when the object has a `PT_DYNAMIC`/`.dynamic` table.
     pub has_dynamic: bool,
+    /// `DT_FLAGS_1`; bit `DF_1_PIE` marks a position-independent executable.
+    pub flags_1: u64,
     pub symbols: Vec<DynSymbol>,
     /// Versioned imports grouped by the object that must provide them.
     pub version_needs: Vec<VersionNeed>,
@@ -390,6 +396,7 @@ impl ElfFile {
             .and_then(dyn_str)
             .map(|s| split_paths(&s))
             .unwrap_or_default();
+        let flags_1 = dyn_get(&dynamic, DT_FLAGS_1).unwrap_or(0);
 
         // Locate `.dynsym` and how many entries it has.
         let dynsym_sec = section_by_name(&shdrs, shstr, endian, ".dynsym")
@@ -464,6 +471,7 @@ impl ElfFile {
             rpath,
             runpath,
             has_dynamic,
+            flags_1,
             symbols,
             version_needs,
             defined_versions,
@@ -481,6 +489,9 @@ impl ElfFile {
             ElfType::Shared if self.interpreter.is_some() => {
                 "position-independent executable (PIE)"
             }
+            ElfType::Shared if self.is_static_pie() => {
+                "static position-independent executable (PIE)"
+            }
             ElfType::Shared if self.soname.is_some() => "shared library",
             ElfType::Shared => "position-independent object",
             ElfType::Relocatable => "relocatable object",
@@ -494,13 +505,26 @@ impl ElfFile {
         matches!(self.etype, ElfType::Executable | ElfType::Shared) && self.interpreter.is_some()
     }
 
+    /// An `ET_DYN` executable that carries its own runtime (no `PT_INTERP`).
+    ///
+    /// `DT_FLAGS_1` with `DF_1_PIE` is authoritative; the fallback covers older
+    /// toolchains that statically link a PIE without setting the flag.
+    pub fn is_static_pie(&self) -> bool {
+        self.etype == ElfType::Shared
+            && self.interpreter.is_none()
+            && (self.flags_1 & DF_1_PIE != 0 || (self.soname.is_none() && self.entry != 0))
+    }
+
     /// The execute bit matters for this object: it is a program, not a library.
     ///
     /// A plain shared library is normally not executable, so only executables
-    /// (including static ones) and position-independent executables qualify.
+    /// (static or dynamic), dynamic PIEs and static PIEs qualify.
     pub fn is_runnable(&self) -> bool {
-        matches!(self.etype, ElfType::Executable)
-            || (matches!(self.etype, ElfType::Shared) && self.interpreter.is_some())
+        match self.etype {
+            ElfType::Executable => true,
+            ElfType::Shared => self.interpreter.is_some() || self.is_static_pie(),
+            _ => false,
+        }
     }
 
     /// The version name attached to a symbol, if it is versioned.
@@ -1096,6 +1120,34 @@ mod tests {
         );
         assert!(!elf.symbols.is_empty());
         assert!(elf.symbols.iter().any(|s| s.undefined));
+    }
+
+    #[test]
+    fn recognises_a_static_pie() {
+        let mut elf = ElfFile::parse(&self_exe()).expect("parse test binary");
+        // Simulate `gcc -static-pie`: ET_DYN, no interpreter, DF_1_PIE set.
+        elf.etype = ElfType::Shared;
+        elf.interpreter = None;
+        elf.soname = None;
+        elf.entry = 0x1000;
+        elf.flags_1 = DF_1_PIE;
+        assert!(elf.is_static_pie());
+        assert!(elf.is_runnable());
+        assert_eq!(elf.kind(), "static position-independent executable (PIE)");
+
+        // A plain shared library is not runnable.
+        elf.flags_1 = 0;
+        elf.entry = 0;
+        elf.soname = Some("libexample.so.1".to_string());
+        assert!(!elf.is_static_pie());
+        assert!(!elf.is_runnable());
+        assert_eq!(elf.kind(), "shared library");
+
+        // A dynamic PIE (ET_DYN with an interpreter) is runnable too.
+        elf.interpreter = Some("/lib64/ld-linux-x86-64.so.2".to_string());
+        assert!(!elf.is_static_pie());
+        assert!(elf.is_runnable());
+        assert_eq!(elf.kind(), "position-independent executable (PIE)");
     }
 
     #[test]

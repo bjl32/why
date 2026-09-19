@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal};
 
 use crate::analyze::{
-    Analysis, ArchFinding, LibResolution, LibraryFinding, PermissionFinding, Status, TargetKind,
-    UnresolvedSymbol, VersionProblem,
+    Analysis, ArchFinding, InterpreterProblem, LibResolution, LibraryFinding, PermissionFinding,
+    Status, TargetKind, UnresolvedSymbol, VersionProblem,
 };
 use crate::cli::Options;
 use crate::distro::Distro;
@@ -287,16 +287,22 @@ fn render_interpreter(out: &mut String, analysis: &Analysis, options: &Options, 
     } else if !interpreter.executable {
         // A loader without the execute bit cannot start anything.
         (Status::Fail, "not executable")
-    } else if interpreter.wrong_architecture.is_some() {
-        // The kernel rejects a loader of the wrong class or machine.
-        (Status::Fail, "wrong architecture")
+    } else if interpreter.problem.is_some() {
+        // The kernel rejects a loader that is not a usable ELF object.
+        (Status::Fail, "not a valid loader")
     } else {
         (Status::Ok, "present")
     };
     section(out, painter, status, title, options.ascii);
     let _ = writeln!(out, "{}", row(painter, &interpreter.path, value, status));
-    if let Some((found, wanted)) = interpreter.wrong_architecture {
-        let _ = writeln!(out, "      built for {found}, but the program is {wanted}");
+    match &interpreter.problem {
+        Some(InterpreterProblem::WrongArchitecture { found, wanted }) => {
+            let _ = writeln!(out, "      built for {found}, but the program is {wanted}");
+        }
+        Some(InterpreterProblem::NotLoadable(reason)) => {
+            let _ = writeln!(out, "      {reason}");
+        }
+        None => {}
     }
     let _ = writeln!(out);
 }
@@ -638,11 +644,16 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
             };
             steps.push(message);
         }
-        if let Some((found, wanted)) = interpreter.wrong_architecture {
-            steps.push(format!(
+        match &interpreter.problem {
+            Some(InterpreterProblem::WrongArchitecture { found, wanted }) => steps.push(format!(
                 "The ELF interpreter {} is built for {found} but the program is {wanted}; the loader path is wrong (reinstall the program or the C library)",
                 interpreter.path
-            ));
+            )),
+            Some(InterpreterProblem::NotLoadable(reason)) => steps.push(format!(
+                "The ELF interpreter {} cannot be used as a loader ({reason}); reinstall the program or the C library",
+                interpreter.path
+            )),
+            None => {}
         }
     }
     // Architecture advice is noise for something that is not a program.

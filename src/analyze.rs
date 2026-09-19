@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::elf::{Binding, Class, ElfError, ElfFile, ElfType};
-use crate::resolve::{expand_dirs, identify, ElfIdentity, Resolver, SearchOutcome};
+use crate::resolve::{expand_dirs, ElfIdentity, Resolver, SearchOutcome};
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,15 +85,27 @@ pub struct ArchFinding {
     pub exact: bool,
 }
 
+/// Why an interpreter cannot serve as a loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpreterProblem {
+    /// The loader is built for a different class or machine than the program.
+    WrongArchitecture {
+        found: &'static str,
+        wanted: &'static str,
+    },
+    /// The loader is not a loadable ELF object at all (not ELF, truncated, or
+    /// of a type the kernel will not run).
+    NotLoadable(String),
+}
+
 /// The `PT_INTERP` (or shebang) interpreter.
 #[derive(Debug, Clone)]
 pub struct InterpreterFinding {
     pub path: String,
     pub exists: bool,
     pub executable: bool,
-    /// `Some((found, wanted))` when the interpreter is an ELF object built for
-    /// a different class or machine than the program it has to load.
-    pub wrong_architecture: Option<(&'static str, &'static str)>,
+    /// Set when the interpreter cannot actually load the program.
+    pub problem: Option<InterpreterProblem>,
 }
 
 /// Whether the file can actually be executed.
@@ -217,10 +229,7 @@ impl Analysis {
             }
         }
         if let Some(interpreter) = &self.interpreter {
-            if !interpreter.exists
-                || !interpreter.executable
-                || interpreter.wrong_architecture.is_some()
-            {
+            if !interpreter.exists || !interpreter.executable || interpreter.problem.is_some() {
                 count += 1;
             }
         }
@@ -326,6 +335,11 @@ fn analyze_script(path: &Path, data: &[u8]) -> Analysis {
     } else {
         shebang.split_whitespace().next().unwrap_or("").to_string()
     };
+    if via_env && command.chars().any(char::is_whitespace) {
+        notes.push(format!(
+            "`env` treats `{command}` as one command name; a shebang argument with spaces needs `-S` and no quoting"
+        ));
+    }
 
     Analysis {
         path: path.to_path_buf(),
@@ -354,13 +368,13 @@ fn is_env_shebang(shebang: &str) -> bool {
 
 /// The command named after `env`, skipping its options and `VAR=value` pairs.
 ///
-/// `env` options are not uniform: `-u`/`--unset` and `-C`/`--chdir` take a
-/// separate value, so that value must be consumed too or it is mistaken for the
-/// interpreter (`env -u FOO python3`). Short options may attach their value
-/// (`-uFOO`, `-C/tmp`), and `VAR=value` assignments precede the command.
+/// The kernel passes the whole shebang tail as a single argument, so `env`
+/// needs `-S` to split it; that split follows shell-like rules, so quotes group
+/// words. Options are not uniform either: `-u`/`--unset` and `-C`/`--chdir`
+/// take a value, which must be consumed or it is mistaken for the command.
 fn env_command(shebang: &str) -> String {
-    let mut fields = shebang.split_whitespace();
-    let _ = fields.next();
+    let mut fields = shell_split(shebang).into_iter();
+    let _ = fields.next(); // the env program itself
     let mut expect_value = false;
     let mut options_done = false;
 
@@ -370,33 +384,46 @@ fn env_command(shebang: &str) -> String {
             continue;
         }
         if options_done {
-            return field.to_string();
+            return field;
         }
         if field == "--" {
             options_done = true;
             continue;
         }
+        if field == "-S" || field == "--split-string" {
+            // Everything after this is the command line to split.
+            options_done = true;
+            continue;
+        }
         if let Some(value) = field.strip_prefix("--split-string=") {
-            // The rest of the option is the command line to split.
-            return value
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            return shell_split(value).into_iter().next().unwrap_or_default();
         }
         if field.starts_with("--") {
-            // The long forms of the value-taking options are the exception;
-            // `--unset=NAME` carries its value inline and needs no lookahead.
-            let name = field.split('=').next().unwrap_or(field);
+            // `--unset=NAME` carries its value inline; the separate forms need
+            // a lookahead.
+            let name = field.split('=').next().unwrap_or(&field);
             if !field.contains('=') && matches!(name, "--unset" | "--chdir") {
                 expect_value = true;
             }
             continue;
         }
         if field.starts_with('-') && field.len() > 1 {
-            // Walk the short-option cluster; `u` and `C` consume a value.
+            // Walk the short-option cluster: `u` and `C` take a value, `S`
+            // means the rest is a command line to split.
             let mut chars = field[1..].chars().peekable();
             while let Some(flag) = chars.next() {
+                if flag == 'S' {
+                    let attached: String = chars.collect();
+                    if attached.is_empty() {
+                        options_done = true;
+                    } else {
+                        return shell_split(&attached)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default();
+                    }
+                    break;
+                }
                 if flag == 'u' || flag == 'C' {
                     expect_value = chars.peek().is_none();
                     break;
@@ -408,9 +435,58 @@ fn env_command(shebang: &str) -> String {
         if field.contains('=') {
             continue;
         }
-        return field.to_string();
+        return field;
     }
     String::new()
+}
+
+/// Splits a string the way `env -S` does: shell-like quoting and escapes.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            '\'' | '"' => {
+                has_token = true;
+                let quote = c;
+                while let Some(q) = chars.next() {
+                    if q == quote {
+                        break;
+                    }
+                    if q == '\\' && quote == '"' {
+                        if let Some(escaped) = chars.next() {
+                            current.push(escaped);
+                        }
+                    } else {
+                        current.push(q);
+                    }
+                }
+            }
+            '\\' => {
+                has_token = true;
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            other => {
+                has_token = true;
+                current.push(other);
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
@@ -441,13 +517,10 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     };
     let interpreter = root.interpreter.as_deref().map(|path| {
         let mut finding = interpreter_finding(path, false);
-        // The kernel rejects a loader built for another class or machine before
-        // it ever reaches the library search path.
+        // A loader the kernel cannot exec (not ELF, truncated, wrong class or
+        // machine) fails before any library is searched for.
         if finding.exists && finding.executable {
-            if let Ok(loader) = identify(Path::new(path)) {
-                finding.wrong_architecture =
-                    interpreter_arch_mismatch(root.machine, root.class, &loader);
-            }
+            finding.problem = interpreter_problem(&root, path);
         }
         finding
     });
@@ -775,6 +848,31 @@ fn interpreter_arch_mismatch(
     }
 }
 
+/// Checks that a `PT_INTERP` target is an ELF object the kernel can load, of
+/// the same class and machine as the program.
+///
+/// Reading just the identity is not enough: an executable text file or a
+/// truncated ELF would pass that check but is rejected by the kernel.
+fn interpreter_problem(program: &ElfFile, path: &str) -> Option<InterpreterProblem> {
+    match ElfFile::parse(Path::new(path)) {
+        Ok(loader) => {
+            if !matches!(loader.etype, ElfType::Executable | ElfType::Shared) {
+                return Some(InterpreterProblem::NotLoadable(format!(
+                    "it is a {}, which cannot be used as a loader",
+                    loader.kind()
+                )));
+            }
+            let identity = ElfIdentity {
+                class: loader.class,
+                machine: loader.machine,
+            };
+            interpreter_arch_mismatch(program.machine, program.class, &identity)
+                .map(|(found, wanted)| InterpreterProblem::WrongArchitecture { found, wanted })
+        }
+        Err(error) => Some(InterpreterProblem::NotLoadable(error.to_string())),
+    }
+}
+
 /// Machine pairs whose host CPU can execute the target's code directly.
 fn runs_compatibly(host: u16, target: u16) -> bool {
     matches!(
@@ -792,13 +890,13 @@ fn interpreter_finding(command: &str, via_path: bool) -> InterpreterFinding {
                 path: found.display().to_string(),
                 exists: true,
                 executable: true,
-                wrong_architecture: None,
+                problem: None,
             },
             None => InterpreterFinding {
                 path: command.to_string(),
                 exists: false,
                 executable: false,
-                wrong_architecture: None,
+                problem: None,
             },
         };
     }
@@ -807,7 +905,7 @@ fn interpreter_finding(command: &str, via_path: bool) -> InterpreterFinding {
         path: command.to_string(),
         exists: candidate.exists(),
         executable: is_executable(candidate),
-        wrong_architecture: None,
+        problem: None,
     }
 }
 
@@ -1015,5 +1113,11 @@ mod tests {
         );
         assert_eq!(env_command("/usr/bin/env -i python3"), "python3");
         assert_eq!(env_command("/usr/bin/env -- python3"), "python3");
+        // `-S` splits with shell rules: quotes are stripped and group words.
+        assert_eq!(env_command("/usr/bin/env -S \"python3\" -O"), "python3");
+        assert_eq!(env_command("/usr/bin/env -S python3 -O"), "python3");
+        assert_eq!(env_command("/usr/bin/env -S 'python3' -O"), "python3");
+        // A fully quoted command is one word, exactly as env sees it.
+        assert_eq!(env_command("/usr/bin/env -S \"python3 -O\""), "python3 -O");
     }
 }

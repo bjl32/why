@@ -312,3 +312,68 @@ fn a_non_elf_library_is_not_reported_as_resolved() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn reports_an_interpreter_that_is_not_a_loader() {
+    let dir = temp_dir("bad-loader");
+    let source = std::env::current_exe().unwrap();
+    let elf = ElfFile::parse(&source).unwrap();
+    let Some(interp) = elf.interpreter.clone() else {
+        return;
+    };
+
+    // An executable that is not an ELF object at all.
+    let loader = std::env::temp_dir().join(format!("why-loader-{}", std::process::id()));
+    fs::write(&loader, b"#!/bin/sh\necho not a loader\n").unwrap();
+    let mut permissions = fs::metadata(&loader).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&loader, permissions).unwrap();
+
+    // Point PT_INTERP at it, padding to the original length so offsets hold.
+    let mut replacement = loader.display().to_string().into_bytes();
+    replacement.push(0);
+    assert!(
+        replacement.len() <= interp.len() + 1,
+        "temp loader path is too long to patch in place"
+    );
+    replacement.resize(interp.len() + 1, 0);
+
+    let data = fs::read(&source).unwrap();
+    let patched = replace_all(&data, format!("{interp}\0").as_bytes(), &replacement);
+    let path = dir.join("bad-loader");
+    fs::write(&path, patched).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+
+    let output = run(&["--no-color", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("not a valid loader"), "{stdout}");
+
+    fs::remove_file(&loader).ok();
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn strips_quotes_in_an_env_split_string() {
+    let dir = temp_dir("env-split");
+    let script = dir.join("script");
+    fs::write(
+        &script,
+        b"#!/usr/bin/env -S \"why-no-such-interpreter\" -O\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let output = run(&["--no-color", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    // The quotes must not end up in the interpreter name.
+    assert!(stdout.contains("why-no-such-interpreter"), "{stdout}");
+    assert!(!stdout.contains('"'), "{stdout}");
+
+    fs::remove_dir_all(&dir).ok();
+}
