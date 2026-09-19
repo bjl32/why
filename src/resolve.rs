@@ -63,35 +63,60 @@ pub enum SearchOutcome {
     /// A file with the right name exists, but it is built for another
     /// architecture, so the loader cannot use it.
     WrongArchitecture(PathBuf, ElfIdentity),
+    /// A file with the right name exists, but it is not a loadable ELF object
+    /// (not ELF at all, or unreadable).
+    Unusable(PathBuf, &'static str),
     /// Nothing with that name exists anywhere in the search path.
     Missing,
+}
+
+/// Why a candidate could not be identified as an ELF object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifyError {
+    /// The file could not be opened or read.
+    Unreadable,
+    /// The file does not begin with an ELF header.
+    NotElf,
+}
+
+impl IdentifyError {
+    /// A short phrase for the report.
+    pub fn message(self) -> &'static str {
+        match self {
+            IdentifyError::Unreadable => "unreadable",
+            IdentifyError::NotElf => "not an ELF object",
+        }
+    }
 }
 
 /// Reads just the ELF identity (class and machine) of a file.
 ///
 /// Only the first 20 bytes are read, so this is cheap even for a huge library.
-pub fn identify(path: &Path) -> Option<ElfIdentity> {
-    let mut file = fs::File::open(path).ok()?;
+/// A file that is not an ELF object is an error, not "unknown": the loader
+/// cannot use it, and reporting it as found would hide a broken library.
+pub fn identify(path: &Path) -> Result<ElfIdentity, IdentifyError> {
+    let mut file = fs::File::open(path).map_err(|_| IdentifyError::Unreadable)?;
     let mut header = [0u8; 20];
-    file.read_exact(&mut header).ok()?;
+    file.read_exact(&mut header)
+        .map_err(|_| IdentifyError::Unreadable)?;
     if &header[0..4] != b"\x7fELF" {
-        return None;
+        return Err(IdentifyError::NotElf);
     }
     let class = match header[4] {
         1 => Class::Elf32,
         2 => Class::Elf64,
-        _ => return None,
+        _ => return Err(IdentifyError::NotElf),
     };
     let endian = match header[5] {
         1 => Endian::Little,
         2 => Endian::Big,
-        _ => return None,
+        _ => return Err(IdentifyError::NotElf),
     };
     let machine = match endian {
         Endian::Little => u16::from_le_bytes([header[18], header[19]]),
         Endian::Big => u16::from_be_bytes([header[18], header[19]]),
     };
-    Some(ElfIdentity { class, machine })
+    Ok(ElfIdentity { class, machine })
 }
 
 /// Resolves `DT_NEEDED` names against the real search path.
@@ -151,26 +176,35 @@ impl Resolver {
         };
 
         let mut mismatched: Option<(PathBuf, ElfIdentity)> = None;
+        let mut unusable: Option<(PathBuf, &'static str)> = None;
         for candidate in candidates {
             if !candidate.is_file() {
                 continue;
             }
             match wanted {
                 Some(want) => match identify(&candidate) {
-                    Some(found) if found.matches(want) => return SearchOutcome::Found(candidate),
-                    Some(found) => {
+                    Ok(found) if found.matches(want) => return SearchOutcome::Found(candidate),
+                    Ok(found) => {
                         mismatched.get_or_insert((candidate, found));
                     }
-                    // Not an ELF object: nothing to compare, so accept it.
-                    None => return SearchOutcome::Found(candidate),
+                    // A file that is not an ELF object cannot be loaded. Keep
+                    // looking: a real library with this name may follow it.
+                    Err(reason) => {
+                        unusable.get_or_insert((candidate, reason.message()));
+                    }
                 },
                 None => return SearchOutcome::Found(candidate),
             }
         }
 
+        // A wrong-architecture ELF is a more useful near-miss than a file that
+        // is not ELF at all, so it wins when both were seen.
         match mismatched {
             Some((path, found)) => SearchOutcome::WrongArchitecture(path, found),
-            None => SearchOutcome::Missing,
+            None => match unusable {
+                Some((path, reason)) => SearchOutcome::Unusable(path, reason),
+                None => SearchOutcome::Missing,
+            },
         }
     }
 }
@@ -420,8 +454,66 @@ mod tests {
                 assert_eq!(identify(&path).unwrap(), wanted, "resolved {path:?}");
             }
             SearchOutcome::WrongArchitecture(_, found) => assert_ne!(found, wanted),
-            SearchOutcome::Missing => {}
+            other => panic!("unexpected outcome {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_non_elf_file_is_not_a_resolution() {
+        // A text file named like a library must not count as "found": the
+        // loader cannot use it, so the analysis would wrongly succeed.
+        let dir = std::env::temp_dir().join(format!("why-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("libfakeshadow.so.1");
+        std::fs::write(&fake, b"this is not an ELF object, just text\n").unwrap();
+
+        let resolver = Resolver::new();
+        let outcome = resolver.search(
+            "libfakeshadow.so.1",
+            Some(host_identity()),
+            std::slice::from_ref(&dir),
+            &[],
+        );
+        assert!(
+            matches!(outcome, SearchOutcome::Unusable(_, "not an ELF object")),
+            "{outcome:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_real_library_behind_a_decoy_is_still_found() {
+        // The decoy must not stop the search: the real file later in the path
+        // is the one the loader would use.
+        let base = std::env::temp_dir().join(format!("why-resolve-decoy-{}", std::process::id()));
+        let decoy_dir = base.join("decoy");
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        std::fs::write(decoy_dir.join("libdecoy.so.1"), b"not elf\n").unwrap();
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            real_dir.join("libdecoy.so.1"),
+        )
+        .unwrap();
+
+        let resolver = Resolver::new();
+        let outcome = resolver.search(
+            "libdecoy.so.1",
+            Some(host_identity()),
+            &[decoy_dir.clone(), real_dir.clone()],
+            &[],
+        );
+        match outcome {
+            SearchOutcome::Found(path) => {
+                assert!(path.starts_with(&real_dir), "found {path:?}");
+            }
+            other => panic!("expected the real library, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
