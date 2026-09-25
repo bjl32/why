@@ -10,7 +10,7 @@ depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Run `updpkgsums` once the v$pkgver tag exists; it fills this in for you.
-sha256sums=('SKIP')
+sha256sums=('68e096e63b36f3efab7077de6e750daeafb2113b081dde13010f503fed240188')
 
 build() {
   cd "$pkgname-$pkgver"
