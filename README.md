@@ -14,8 +14,8 @@ language instead of dumping 800 lines of diagnostic output.
 
 ## Status
 
-This is **v0.1**, which covers the first stop on the evolution path in
-[`TODO`](TODO): **ELF and shared libraries**.
+This is **v0.2**, covering ELF/shared-library diagnosis plus Arch package
+ownership lookups.
 
 ps. **PRs / Issues are welcome, join our [discord](https://discord.gg/DWwzh2cQzf)!**
 
@@ -69,7 +69,7 @@ When everything checks out, the report says so and stops:
 ✓ no problems found
 ```
 
-## What v0.1 checks
+## What v0.2 checks
 
 | Check | What it means |
 | --- | --- |
@@ -81,17 +81,18 @@ When everything checks out, the report says so and stops:
 | **Symbol dependencies** | Collects the global symbol scope of the whole dependency graph and reports imported (`STB_GLOBAL`, `SHN_UNDEF`) symbols that nobody defines. Imports are matched by name **and** symbol version where both are known, so `foo@OTHER` cannot satisfy an import of `foo@VER`. |
 | **Library versions** | Checks every `.gnu.version_r` requirement against the `.gnu.version_d` definitions of the library that must provide it, so it can say *"needs `GLIBC_2.99`, provides `GLIBC_2.44`"*. |
 | **Environment** | Flags `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_DEBUG`, because they silently change which libraries get loaded. |
+| **Package ownership** | On Arch, checks the target, interpreter, and every resolved or missing library with `pacman -Qo`/`pacman -F`. Lookup failures are informational and do not change the ELF diagnosis. |
 
 The ELF parsing is done in-process, so the answer does not depend on `ldd`,
 `readelf` or `objdump` being installed or working.
 
 ## Not yet
 
-Everything else on the roadmap is still in [`TODO`](TODO): package ownership
-(v0.2), process/environment inspection (v0.3), Wayland/X11/Vulkan (v0.4),
-Flatpak, Wine/Proton, kernel/journal/coredumps, automatic diagnosis and HTML
-reports. When a target is clean but still fails, the report says the failure is
-probably outside the ELF metadata rather than pretending to know more.
+Everything else on the roadmap is still in [`TODO`](TODO): process inspection
+(v0.3), Wayland/X11/Vulkan (v0.4), Flatpak, Wine/Proton,
+kernel/journal/coredumps, automatic diagnosis and HTML reports. When a target
+is clean but still fails, the report says the failure is probably outside the
+ELF metadata rather than pretending to know more.
 
 ## Build
 
@@ -149,6 +150,7 @@ src/
   resolve.rs    dynamic-loader search-path semantics, ld.so.cache, ld.so.conf
   analyze.rs    the dependency walk and the checks
   report.rs     the human-readable report
+  package.rs    Arch package ownership queries
   distro.rs     package-manager hints for "which package provides this?"
   cli.rs        argument parsing
 ```

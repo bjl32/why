@@ -1,7 +1,7 @@
 //! Distribution detection, used only to phrase suggested next steps.
 //!
-//! `why` v0.1 does not query package databases (that is v0.2); it merely knows
-//! which command the user would run to answer "which package ships this file?".
+//! Distribution detection supports the package ownership checks currently
+//! implemented for Arch, and phrases suggested next steps for other systems.
 
 use std::fs;
 

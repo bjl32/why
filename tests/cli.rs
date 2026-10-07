@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use why::analyze::{analyze, LibResolution};
+use why::distro::{Distro, Family};
 use why::elf::{Binding, ElfFile};
 
 fn why_binary() -> PathBuf {
@@ -18,6 +19,14 @@ fn why_binary() -> PathBuf {
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(why_binary())
+        .args(args)
+        .output()
+        .expect("run why")
+}
+
+fn run_without_pacman(args: &[&str]) -> std::process::Output {
+    Command::new(why_binary())
+        .env("PATH", "/definitely/no-pacman-here")
         .args(args)
         .output()
         .expect("run why")
@@ -106,6 +115,22 @@ fn reports_a_healthy_binary_as_clean() {
     let output = run(&["--no-color", exe.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("no problems found"), "{stdout}");
+    assert!(stdout.contains("Package ownership"), "{stdout}");
+}
+
+#[test]
+fn missing_pacman_is_only_an_informational_warning() {
+    let exe = std::env::current_exe().unwrap();
+    let output = run_without_pacman(&["--ascii", "--no-color", exe.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("Package ownership"), "{stdout}");
+    if Distro::detect().family == Family::Arch {
+        assert!(stdout.contains("pacman was not found on PATH"), "{stdout}");
+    } else {
+        assert!(stdout.contains("available only on Arch Linux"), "{stdout}");
+    }
     assert!(stdout.contains("no problems found"), "{stdout}");
 }
 

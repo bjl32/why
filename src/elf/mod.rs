@@ -1,6 +1,6 @@
 //! A small, dependency-free ELF reader.
 //!
-//! `why` v0.1 only needs a handful of facts from an ELF object: the machine it
+//! `why` only needs a handful of facts from an ELF object: the machine it
 //! targets, how it is started (the interpreter), which shared objects it asks
 //! for, and which symbols it expects those objects to provide. Everything else
 //! — relocations, notes, debug info — is deliberately ignored.

@@ -56,7 +56,7 @@ $ cargo test
 $ cargo run -- ./some-program
 ```
 
-v0.1 has **no external dependencies**. The ELF reader is deliberately part of
+v0.2 has **no external dependencies**. The ELF reader is deliberately part of
 the project so the tool stays auditable, builds offline, and does not break when
 `ldd`/`readelf` are missing — which, for a diagnostic tool, is exactly when they
 matter most.
@@ -116,7 +116,7 @@ Nothing outside `src/elf/` should need to know the layout of an ELF file.
    bounds-checked and returns an error. A panic is a bug.
 4. **No dependencies without a reason.** A new crate should solve a meaningful problem that would otherwise require substantially more code or maintenance.
 5. **Linux and ELF first.** Other platforms and formats are out of scope for
-   v0.1; guard such work behind a discussion.
+   v0.2; guard such work behind a discussion.
 6. **Deterministic output.** Sort findings so reports are stable and diffable.
 7. **Terminals are optional.** Respect `--no-color`, `NO_COLOR` and `--ascii`;
    never hard-code ANSI escapes.
@@ -138,7 +138,7 @@ Roughly the shape of a new check, using "missing interpreter" as an example:
    `suggestions()` in `src/report.rs`.
 6. **Test it.** Unit-test the fact itself. If it changes the verdict, add an
    end-to-end test in `tests/cli.rs`.
-7. **Document it.** Add a row to the "What v0.1 checks" table in the README, and
+7. **Document it.** Add a row to the "What v0.2 checks" table in the README, and
    update the roadmap in `TODO` if the item is finished.
 
 ## Testing

@@ -14,6 +14,7 @@ use crate::analyze::{
 use crate::cli::Options;
 use crate::distro::Distro;
 use crate::elf::{Class, ElfType};
+use crate::package::{Ownership, PackageStatus};
 
 /// Column where the right-hand status/value is aligned.
 const VALUE_COLUMN: usize = 54;
@@ -167,10 +168,11 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
             out,
             "{}",
             painter.dim(
-                "why v0.1 inspects ELF programs and scripts; other file types are not understood yet."
+                "why v0.2 inspects ELF programs and scripts; other file types are not understood yet."
             )
         );
         let _ = writeln!(out);
+        render_packages(out, analysis, options, painter);
         let _ = writeln!(out, "{}", summary_line(analysis, options, painter));
         return;
     }
@@ -191,7 +193,106 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
     render_environment(out, analysis, options, painter);
     render_notes(out, analysis, painter);
     render_suggestions(out, analysis, painter);
+    render_packages(out, analysis, options, painter);
     let _ = writeln!(out, "{}", summary_line(analysis, options, painter));
+}
+
+fn render_packages(out: &mut String, analysis: &Analysis, options: &Options, painter: &Painter) {
+    let Some(report) = &analysis.packages else {
+        return;
+    };
+
+    // Package lookup is deliberately informational.  A missing pacman
+    // database must never turn an otherwise healthy ELF diagnosis into a
+    // failure or change the process exit status.
+    section(
+        out,
+        painter,
+        Status::Info,
+        "Package ownership",
+        options.ascii,
+    );
+    match &report.status {
+        PackageStatus::Available => {
+            for finding in &report.findings {
+                render_package_finding(out, finding, painter);
+            }
+            if report.findings.is_empty() {
+                let _ = writeln!(out, "  no package paths to query");
+            }
+        }
+        PackageStatus::Unavailable(reason) => {
+            let _ = writeln!(out, "  informational warning: {reason}");
+            for finding in &report.findings {
+                render_package_finding(out, finding, painter);
+            }
+        }
+        PackageStatus::Unsupported(distro) => {
+            let _ = writeln!(
+                out,
+                "  package ownership lookup is currently available only on Arch Linux (detected {distro})"
+            );
+        }
+    }
+    let _ = writeln!(out);
+}
+
+fn render_package_finding(
+    out: &mut String,
+    finding: &crate::package::PackageFinding,
+    painter: &Painter,
+) {
+    match &finding.ownership {
+        Ownership::Installed(owners) => {
+            let value = if owners.is_empty() {
+                "owned (package unknown)".to_string()
+            } else {
+                format!("owned by {}", owners.join(", "))
+            };
+            let _ = writeln!(
+                out,
+                "{}",
+                row(painter, &finding.subject, &value, Status::Ok)
+            );
+        }
+        Ownership::SearchResults(packages) => {
+            let value = if packages.is_empty() {
+                "no package found".to_string()
+            } else {
+                format!("provided by {}", packages.join(", "))
+            };
+            let _ = writeln!(
+                out,
+                "{}",
+                row(painter, &finding.subject, &value, Status::Info)
+            );
+        }
+        Ownership::Unowned => {
+            let _ = writeln!(
+                out,
+                "{}",
+                row(
+                    painter,
+                    &finding.subject,
+                    "not owned by a package",
+                    Status::Info
+                )
+            );
+        }
+        Ownership::Unavailable(reason) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                row(
+                    painter,
+                    &finding.subject,
+                    "lookup unavailable",
+                    Status::Info
+                )
+            );
+            let _ = writeln!(out, "      {reason}");
+        }
+    }
 }
 
 fn render_file_type(
@@ -705,7 +806,7 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
 
 fn summary_line(analysis: &Analysis, options: &Options, painter: &Painter) -> String {
     if !analysis.is_analyzable() {
-        return painter.dim("why v0.1 cannot diagnose this file");
+        return painter.dim("why v0.2 cannot diagnose this file");
     }
     let problems = analysis.problem_count();
     if problems == 0 {
@@ -744,6 +845,7 @@ fn truncate(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::analyze::analyze;
+    use crate::package::{Ownership, PackageFinding, PackageReport, PackageStatus};
 
     #[test]
     fn a_healthy_binary_reports_no_problems() {
@@ -785,5 +887,30 @@ mod tests {
     fn truncation_keeps_it_short() {
         assert_eq!(truncate("abcdef", 3), "ab…");
         assert_eq!(truncate("abc", 3), "abc");
+    }
+
+    #[test]
+    fn package_lookup_is_a_separate_informational_section() {
+        let path = std::env::current_exe().unwrap();
+        let mut analysis = analyze(&path).unwrap();
+        analysis.packages = Some(PackageReport {
+            status: PackageStatus::Unavailable("pacman file database is unavailable".into()),
+            findings: vec![PackageFinding {
+                subject: "target".into(),
+                query: path.display().to_string(),
+                ownership: Ownership::Unavailable("database is not synced".into()),
+            }],
+        });
+        let options = Options {
+            ascii: true,
+            no_color: true,
+            ..Options::default()
+        };
+        let text = to_string(&analysis, &options);
+        assert!(text.contains("Package ownership"), "{text}");
+        assert!(text.contains("informational warning"), "{text}");
+        assert!(text.contains("lookup unavailable"), "{text}");
+        assert!(text.contains("no problems found"), "{text}");
+        assert_eq!(analysis.exit_code(), 0);
     }
 }

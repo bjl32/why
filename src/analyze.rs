@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::elf::{Binding, Class, ElfError, ElfFile, ElfType};
+use crate::package::PackageReport;
 use crate::resolve::{expand_dirs, ElfIdentity, Resolver, SearchOutcome};
 
 /// How bad a finding is.
@@ -178,6 +179,7 @@ pub struct EnvFinding {
 pub struct Analysis {
     pub path: PathBuf,
     pub kind: TargetKind,
+    pub packages: Option<PackageReport>,
     /// Set when the target cannot be run at all (a relocatable object or a core
     /// dump). The message explains what it actually is.
     pub not_a_program: Option<String>,
@@ -258,34 +260,40 @@ impl Analysis {
 /// Inspects `path` and returns the findings.
 pub fn analyze(path: &Path) -> Result<Analysis, AnalyzeError> {
     if path.is_dir() {
-        return Ok(plain(
+        return Ok(with_packages(plain(
             path,
             "this is a directory, not a program".to_string(),
-        ));
+        )));
     }
     let data = fs::read(path).map_err(AnalyzeError::Io)?;
 
     if data.starts_with(b"#!") {
-        return Ok(analyze_script(path, &data));
+        return Ok(with_packages(analyze_script(path, &data)));
     }
 
     // Resolve symlinks first so that $ORIGIN and the display path are both
     // sensible, while the report keeps showing the path the user typed.
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     match ElfFile::parse_bytes(&canonical, &data) {
-        Ok(elf) => Ok(analyze_elf(path, canonical, elf)),
-        Err(ElfError::NotElf) => Ok(plain(path, describe_non_elf(&data))),
-        Err(error) => Ok(plain(
+        Ok(elf) => Ok(with_packages(analyze_elf(path, canonical, elf))),
+        Err(ElfError::NotElf) => Ok(with_packages(plain(path, describe_non_elf(&data)))),
+        Err(error) => Ok(with_packages(plain(
             path,
             format!("an ELF file that could not be parsed ({error})"),
-        )),
+        ))),
     }
+}
+
+fn with_packages(mut analysis: Analysis) -> Analysis {
+    analysis.packages = Some(crate::package::collect(&analysis));
+    analysis
 }
 
 fn plain(path: &Path, description: String) -> Analysis {
     Analysis {
         path: path.to_path_buf(),
         kind: TargetKind::NotElf { description },
+        packages: None,
         not_a_program: None,
         arch: None,
         permissions: None,
@@ -346,6 +354,7 @@ fn analyze_script(path: &Path, data: &[u8]) -> Analysis {
         kind: TargetKind::Script {
             interpreter: command.clone(),
         },
+        packages: None,
         not_a_program: None,
         arch: None,
         permissions: permission_finding(path),
@@ -749,6 +758,7 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     Analysis {
         path: display.to_path_buf(),
         kind: TargetKind::Elf(root),
+        packages: None,
         not_a_program,
         arch,
         permissions,

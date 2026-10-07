@@ -1,9 +1,10 @@
 //! `why` — a Linux program troubleshooter.
 //!
-//! Version 0.1 answers one question well: *why does this ELF program not
+//! Version 0.2 answers one question well: *why does this ELF program not
 //! start?* It reads the ELF metadata itself (no `ldd`, no `readelf`), walks
-//! the transitive dependency graph, and reports what is missing in plain
-//! language instead of dumping raw diagnostics.
+//! the transitive dependency graph, identifies Arch package ownership, and
+//! reports what is missing in plain language instead of dumping raw
+//! diagnostics.
 //!
 //! The crate is split so that it can be embedded or tested without the CLI:
 //!
@@ -11,12 +12,14 @@
 //! * [`resolve`] — dynamic-loader library search path semantics
 //! * [`analyze`] — turns ELF facts into findings
 //! * [`report`] — renders findings for humans
+//! * [`package`] — best-effort Arch package ownership queries
 //! * [`distro`] — package-manager hints for suggested next steps
 
 pub mod analyze;
 pub mod cli;
 pub mod distro;
 pub mod elf;
+pub mod package;
 pub mod report;
 pub mod resolve;
 
