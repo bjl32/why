@@ -192,8 +192,8 @@ fn render(out: &mut String, analysis: &Analysis, options: &Options, painter: &Pa
     render_versions(out, analysis, options, painter);
     render_environment(out, analysis, options, painter);
     render_notes(out, analysis, painter);
-    render_suggestions(out, analysis, painter);
     render_packages(out, analysis, options, painter);
+    render_suggestions(out, analysis, painter);
     let _ = writeln!(out, "{}", summary_line(analysis, options, painter));
 }
 
@@ -244,11 +244,7 @@ fn render_package_finding(
 ) {
     match &finding.ownership {
         Ownership::Installed(owners) => {
-            let value = if owners.is_empty() {
-                "owned (package unknown)".to_string()
-            } else {
-                format!("owned by {}", owners.join(", "))
-            };
+            let value = format!("owned by {}", owners.join(", "));
             let _ = writeln!(
                 out,
                 "{}",
@@ -256,11 +252,7 @@ fn render_package_finding(
             );
         }
         Ownership::SearchResults(packages) => {
-            let value = if packages.is_empty() {
-                "no package found".to_string()
-            } else {
-                format!("provided by {}", packages.join(", "))
-            };
+            let value = format!("provided by {}", packages.join(", "));
             let _ = writeln!(
                 out,
                 "{}",
@@ -293,6 +285,7 @@ fn render_package_finding(
             let _ = writeln!(out, "      {reason}");
         }
     }
+    let _ = writeln!(out, "      queried: {}", finding.query);
 }
 
 fn render_file_type(
@@ -656,8 +649,7 @@ fn render_notes(out: &mut String, analysis: &Analysis, painter: &Painter) {
 }
 
 fn render_suggestions(out: &mut String, analysis: &Analysis, painter: &Painter) {
-    let distro = Distro::detect();
-    let steps = suggestions(analysis, &distro);
+    let steps = suggestions(analysis, &analysis.distro);
     if steps.is_empty() {
         return;
     }
@@ -688,11 +680,13 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
     }
 
     for library in analysis.missing_libraries() {
-        let step = format!(
-            "Find and install the package that provides {} — {}",
-            library.name,
-            distro.search_hint(&library.name)
-        );
+        let step = provider_suggestion(analysis, &library.name).unwrap_or_else(|| {
+            format!(
+                "Find and install the package that provides {} — {}",
+                library.name,
+                distro.search_hint(&library.name)
+            )
+        });
         if !steps.contains(&step) {
             steps.push(step);
         }
@@ -728,7 +722,7 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
 
     if let Some(interpreter) = &analysis.interpreter {
         if !interpreter.exists {
-            let message = match analysis.kind {
+            let message = provider_suggestion(analysis, &interpreter.path).unwrap_or_else(|| match analysis.kind {
                 // A bare name (from `#!/usr/bin/env`) is a PATH lookup, not a path.
                 TargetKind::Script { .. } if !interpreter.path.contains('/') => format!(
                     "The interpreter `{}` was not found on PATH; install it or fix PATH",
@@ -742,7 +736,7 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
                     "Install the dynamic loader at {} (usually shipped with the C library; 32-bit programs need the multilib variant)",
                     interpreter.path
                 ),
-            };
+            });
             steps.push(message);
         }
         match &interpreter.problem {
@@ -797,11 +791,38 @@ fn suggestions(analysis: &Analysis, distro: &Distro) -> Vec<String> {
     }
     if steps.is_empty() && analysis.is_analyzable() {
         steps.push(
-            "No problem was found in the ELF metadata; the failure is likely at runtime (arguments, configuration, permissions) or in an area `why` does not inspect yet — see TODO"
+            "No problem was found. The failure is likely at runtime (arguments, configuration, permissions) or in an area currently unsupported."
                 .to_string(),
         );
     }
     steps
+}
+
+fn provider_suggestion(analysis: &Analysis, query: &str) -> Option<String> {
+    let packages = analysis
+        .packages
+        .as_ref()?
+        .findings
+        .iter()
+        .find_map(|finding| {
+            if finding.query == query {
+                if let Ownership::SearchResults(packages) = &finding.ownership {
+                    return Some(packages);
+                }
+            }
+            None
+        })?;
+    if packages.is_empty() {
+        return None;
+    }
+    Some(if packages.len() == 1 {
+        format!(
+            "Install {} to provide {query} (choose the matching architecture)",
+            packages[0]
+        )
+    } else {
+        format!("Packages providing {query}: {}; install the one matching the program's architecture and ABI", packages.join(", "))
+    })
 }
 
 fn summary_line(analysis: &Analysis, options: &Options, painter: &Painter) -> String {
@@ -910,7 +931,79 @@ mod tests {
         assert!(text.contains("Package ownership"), "{text}");
         assert!(text.contains("informational warning"), "{text}");
         assert!(text.contains("lookup unavailable"), "{text}");
+        assert!(
+            text.contains(&format!("queried: {}", path.display())),
+            "{text}"
+        );
         assert!(text.contains("no problems found"), "{text}");
         assert_eq!(analysis.exit_code(), 0);
+    }
+
+    #[test]
+    fn known_providers_replace_search_hints_and_precede_suggestions() {
+        use crate::analyze::{InterpreterFinding, LibraryFinding};
+        let mut analysis = analyze(&std::env::current_exe().unwrap()).unwrap();
+        analysis.libraries = vec![LibraryFinding {
+            name: "libmissing.so".into(),
+            needed_by: vec![],
+            resolution: LibResolution::Missing,
+        }];
+        analysis.interpreter = Some(InterpreterFinding {
+            path: "/usr/bin/missing-interpreter".into(),
+            exists: false,
+            executable: false,
+            problem: None,
+        });
+        analysis.packages = Some(PackageReport {
+            status: PackageStatus::Available,
+            findings: vec![
+                PackageFinding {
+                    subject: "library libmissing.so".into(),
+                    query: "libmissing.so".into(),
+                    ownership: Ownership::SearchResults(vec![
+                        "extra/provider".into(),
+                        "multilib/lib32-provider".into(),
+                    ]),
+                },
+                PackageFinding {
+                    subject: "interpreter".into(),
+                    query: "/usr/bin/missing-interpreter".into(),
+                    ownership: Ownership::SearchResults(vec!["extra/interpreter".into()]),
+                },
+            ],
+        });
+        let steps = suggestions(&analysis, &analysis.distro);
+        assert!(
+            steps.iter().any(|step| step.contains(
+                "Packages providing libmissing.so: extra/provider, multilib/lib32-provider"
+            )),
+            "{steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("Install extra/interpreter")),
+            "{steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.contains("pacman -F") || step.contains("Find and install")),
+            "{steps:?}"
+        );
+        let text = to_string(&analysis, &Options::default());
+        assert!(
+            text.find("Package ownership").unwrap() < text.find("Suggested next steps").unwrap()
+        );
+        assert!(text.contains("queried: libmissing.so"), "{text}");
+        assert!(
+            text.contains("queried: /usr/bin/missing-interpreter"),
+            "{text}"
+        );
+        // Without providers, keep the existing actionable search fallback.
+        analysis.packages = None;
+        assert!(suggestions(&analysis, &analysis.distro)
+            .iter()
+            .any(|step| step.contains("Find and install the package that provides libmissing.so")));
     }
 }

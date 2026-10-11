@@ -1,23 +1,18 @@
 # why
 
-A Linux troubleshooting tool that collects system, application, hardware, and
-runtime diagnostics to identify and explain why something isn't working.
+A Linux troubleshooting tool that collects system, application, hardware, and runtime diagnostics to explain why a program isn't working.
 
-Linux already has an absurd collection of excellent diagnostic tools: `ldd`,
-`readelf`, `strace`, `coredumpctl`, `journalctl`, `vulkaninfo`, `wayland-debug`.
-The missing layer is usually:
+Linux already has plenty of excellent diagnostic tools (`ldd`, `readelf`, `strace`, `coredumpctl`, `journalctl`, `vulkaninfo`, `wayland-debug`). The problem is that they mostly just dump data. 
 
-> **"Okay, but what does all of this mean?"**
-
-`why` is that layer. It runs the checks and then explains the result in plain
-language instead of dumping 800 lines of diagnostic output.
+`why` bridges that gap. It runs the necessary checks and translates the results into a clear, plain-language explanation, rather than dumping hundreds of lines of raw output for the user to decipher.
 
 ## Status
 
-This is **v0.2**, covering ELF/shared-library diagnosis plus Arch package
-ownership lookups.
+This is **v0.2**, which currently covers ELF/shared-library diagnosis and Arch Linux package ownership lookups. 
 
-ps. **PRs / Issues are welcome, join our [discord](https://discord.gg/DWwzh2cQzf)!**
+*(We welcome PRs and issues. Feel free to join our [Discord](https://discord.gg/DWwzh2cQzf) to chat or ask questions.)*
+
+## Example
 
 ```console
 $ why ./some-broken-program
@@ -69,48 +64,27 @@ When everything checks out, the report says so and stops:
 ✓ no problems found
 ```
 
-## What v0.2 checks
+## Installation
 
-| Check | What it means |
-| --- | --- |
-| **File type** | A relocatable object (`.o`) or a core dump is not a program, so it is reported as *not runnable* rather than ending with "no problems found". |
-| **Executable permission** | An ELF program without any execute bit fails at launch with exit 126, so a missing `+x` is reported as a problem rather than a footnote. Plain shared libraries are exempt. |
-| **Architecture** | Compares `e_machine`/ELF class with the host. An exact mismatch is a failure, but a *compatible* one — 32-bit i386 on x86-64, for example — is a warning with a multilib hint rather than a false alarm. Where a machine value is shared across word sizes (MIPS, RISC-V), the class decides, so a 64-bit target on a 32-bit host is still a failure. |
-| **ELF interpreter** | Resolves `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`) and checks that it exists, is executable, and is built for the same class and machine as the program — the kernel rejects a mismatched loader before any library is loaded. For shebang scripts, `#!/usr/bin/env foo` is resolved through `PATH`, including `env`'s own options (`-u`, `-C`, `--unset`, ...). |
-| **Shared libraries** | Walks the transitive `DT_NEEDED` graph and resolves every library the way `ld.so` would: `DT_RPATH`, `LD_LIBRARY_PATH`, `DT_RUNPATH`, the `ld.so` cache, then the default directories. A candidate only counts if its ELF class and machine match the object that needs it, so a 32-bit program is never handed the 64-bit `libc.so.6`; a name that resolves only to the wrong architecture is `WRONG ARCH`, and a same-named file that is not a loadable ELF object (or will not parse) is `UNUSABLE`. |
-| **Symbol dependencies** | Collects the global symbol scope of the whole dependency graph and reports imported (`STB_GLOBAL`, `SHN_UNDEF`) symbols that nobody defines. Imports are matched by name **and** symbol version where both are known, so `foo@OTHER` cannot satisfy an import of `foo@VER`. |
-| **Library versions** | Checks every `.gnu.version_r` requirement against the `.gnu.version_d` definitions of the library that must provide it, so it can say *"needs `GLIBC_2.99`, provides `GLIBC_2.44`"*. |
-| **Environment** | Flags `LD_LIBRARY_PATH`, `LD_PRELOAD` and `LD_DEBUG`, because they silently change which libraries get loaded. |
-| **Package ownership** | On Arch, checks the target, interpreter, and every resolved or missing library with `pacman -Qo`/`pacman -F`. Lookup failures are informational and do not change the ELF diagnosis. |
+The package is available on the Arch AUR.
 
-The ELF parsing is done in-process, so the answer does not depend on `ldd`,
-`readelf` or `objdump` being installed or working.
+```console
+$ yay -S why
+```
+*(Note: Other distributions are not yet supported.)*
 
-## Not yet
-
-Everything else on the roadmap is still in [`TODO`](TODO): process inspection
-(v0.3), Wayland/X11/Vulkan (v0.4), Flatpak, Wine/Proton,
-kernel/journal/coredumps, automatic diagnosis and HTML reports. When a target
-is clean but still fails, the report says the failure is probably outside the
-ELF metadata rather than pretending to know more.
-
-## Build
-
-Rust 1.70+ and no dependencies:
+## Building from source
 
 ```console
 $ cargo build --release
 $ ./target/release/why ./some-broken-program
 ```
 
-or install it:
+Or install it locally:
 
 ```console
 $ cargo install --path .
 ```
-
-On Arch, an AUR package lives in [`packaging/aur/`](packaging/aur); see its
-README for the publish steps.
 
 ## Usage
 
@@ -129,56 +103,19 @@ OPTIONS:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | No problem found in the ELF metadata |
-| `1` | A problem was found |
-| `2` | The file could not be diagnosed (missing, not ELF, unreadable) |
+| `0` | No problems found in the ELF metadata. |
+| `1` | A problem was found. |
+| `2` | The file could not be diagnosed (e.g., missing, not an ELF file, or unreadable). |
 
-That makes it usable in scripts:
+This exit code design makes it easy to use in shell scripts:
 
 ```console
 $ why ./game || echo "game is broken"
 ```
 
-## How it works
-
-```text
-src/
-  elf/          dependency-free ELF reader
-    reader.rs     bounds-checked, endian-aware byte decoding
-    mod.rs        headers, program/section headers, .dynamic, .dynsym,
-                  .gnu.version_r/.gnu.version_d, DT_HASH/DT_GNU_HASH counts
-  resolve.rs    dynamic-loader search-path semantics, ld.so.cache, ld.so.conf
-  analyze.rs    the dependency walk and the checks
-  report.rs     the human-readable report
-  package.rs    Arch package ownership queries
-  distro.rs     package-manager hints for "which package provides this?"
-  cli.rs        argument parsing
-```
-
-The analysis walks `DT_NEEDED` breadth-first, parses every object exactly once,
-and then answers the symbol and version questions from that one graph. Parsing
-never panics: every read is bounds-checked, because a diagnostic tool should be
-able to look at a corrupt binary and say so.
-
-## Tests
-
-```console
-$ cargo test
-$ cargo clippy --all-targets
-```
-
-The suite covers the parser (including truncated and non-ELF inputs), the
-resolver, the report, and the CLI end to end. The missing-library path is tested
-by patching a `DT_NEEDED` string in a copy of the test binary in place, so no
-fixture or compiler is needed at test time.
-
-The symbol and library checks were also cross-validated against `ldd -r` over
-4,745 binaries in `/usr/bin` with no discrepancies.
-
 ## Contributing
 
-Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
-development setup, the project's design principles, and how to add a check.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development setup, design principles, and instructions on how to add a new check.
 
 ## License
 

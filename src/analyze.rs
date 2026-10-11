@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::distro::Distro;
 use crate::elf::{Binding, Class, ElfError, ElfFile, ElfType};
 use crate::package::PackageReport;
 use crate::resolve::{expand_dirs, ElfIdentity, Resolver, SearchOutcome};
@@ -179,6 +180,8 @@ pub struct EnvFinding {
 pub struct Analysis {
     pub path: PathBuf,
     pub kind: TargetKind,
+    /// Detected once and shared by package lookup and report suggestions.
+    pub distro: Distro,
     pub packages: Option<PackageReport>,
     /// Set when the target cannot be run at all (a relocatable object or a core
     /// dump). The message explains what it actually is.
@@ -293,6 +296,7 @@ fn plain(path: &Path, description: String) -> Analysis {
     Analysis {
         path: path.to_path_buf(),
         kind: TargetKind::NotElf { description },
+        distro: Distro::detect(),
         packages: None,
         not_a_program: None,
         arch: None,
@@ -354,6 +358,7 @@ fn analyze_script(path: &Path, data: &[u8]) -> Analysis {
         kind: TargetKind::Script {
             interpreter: command.clone(),
         },
+        distro: Distro::detect(),
         packages: None,
         not_a_program: None,
         arch: None,
@@ -758,6 +763,7 @@ fn analyze_elf(display: &Path, canonical: PathBuf, elf: ElfFile) -> Analysis {
     Analysis {
         path: display.to_path_buf(),
         kind: TargetKind::Elf(root),
+        distro: Distro::detect(),
         packages: None,
         not_a_program,
         arch,
