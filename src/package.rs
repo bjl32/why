@@ -1,7 +1,8 @@
-//! Best-effort, batched Arch package ownership lookups.
+//! Arch package ownership stuff.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -62,6 +63,90 @@ pub fn collect(analysis: &Analysis) -> PackageReport {
         };
     };
     collect_with(analysis, &executable)
+}
+
+/// Offer to refresh Arch's file database when a missing library could not be
+/// searched. This is deliberately interactive and opt-in: scripted runs and
+/// redirected output never download databases or invoke sudo.
+pub fn refresh_if_requested(analysis: &Analysis) -> Result<bool, String> {
+    if analysis.distro.family != Family::Arch
+        || !io::stdin().is_terminal()
+        || !io::stderr().is_terminal()
+        || !needs_file_database_refresh(analysis)
+    {
+        return Ok(false);
+    }
+
+    eprint!(
+        "why: pacman's file database is unavailable. Refresh it with `sudo pacman -Fy`? [y/N] "
+    );
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("could not prompt for pacman refresh: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("could not read pacman refresh choice: {error}"))?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(false);
+    }
+
+    let Some(pacman) = which_pacman() else {
+        return Err("pacman was not found on PATH".into());
+    };
+    eprintln!("why: refreshing the pacman file database…");
+    let status = if is_root() {
+        Command::new(&pacman).arg("-Fy").status()
+    } else {
+        let Some(sudo) = which_program("sudo") else {
+            return Err("sudo was not found on PATH; run `sudo pacman -Fy` manually".into());
+        };
+        Command::new(sudo).arg(&pacman).arg("-Fy").status()
+    }
+    .map_err(|error| format!("could not run pacman file database refresh: {error}"))?;
+    if !status.success() {
+        return Err(format!("pacman file database refresh failed ({status})"));
+    }
+    Ok(true)
+}
+
+fn needs_file_database_refresh(analysis: &Analysis) -> bool {
+    let Some(report) = &analysis.packages else {
+        return false;
+    };
+    analysis.missing_libraries().any(|library| {
+        report.findings.iter().any(|finding| {
+            finding.query == library.name && matches!(finding.ownership, Ownership::Unavailable(_))
+        })
+    })
+}
+
+fn which_program(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        let metadata = fs::metadata(&candidate).ok()?;
+        if metadata.is_file() && is_executable(&metadata) {
+            fs::canonicalize(candidate).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
 }
 
 fn collect_with(analysis: &Analysis, executable: &Path) -> PackageReport {
@@ -167,10 +252,9 @@ fn collect_with(analysis: &Analysis, executable: &Path) -> PackageReport {
 fn which_pacman() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| {
-        use std::os::unix::fs::PermissionsExt;
         let candidate = dir.join("pacman");
         let metadata = fs::metadata(&candidate).ok()?;
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+        if metadata.is_file() && is_executable(&metadata) {
             // PATH can contain relative directories; retain an absolute path
             // and invoke precisely the executable we discovered.
             fs::canonicalize(candidate).ok()

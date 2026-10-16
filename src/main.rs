@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use why::{analyze, cli, report};
+use why::{analyze, cli, package, report};
 
 fn main() -> ExitCode {
     let options = match cli::parse(std::env::args().skip(1)) {
@@ -30,7 +30,17 @@ fn main() -> ExitCode {
     };
 
     match analyze::analyze(&target) {
-        Ok(analysis) => {
+        Ok(mut analysis) => {
+            match package::refresh_if_requested(&analysis) {
+                Ok(true) => match analyze::analyze(&target) {
+                    Ok(refreshed) => analysis = refreshed,
+                    Err(error) => {
+                        eprintln!("why: could not re-run analysis after pacman refresh: {error}")
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => eprintln!("why: {error}"),
+            }
             report::print(&analysis, &options);
             ExitCode::from(analysis.exit_code())
         }
